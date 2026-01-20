@@ -195,6 +195,150 @@ class GenerationModuleLlama:
 
         return out_text, False
 
+    ## Función de respuestas rag optimizada para llamadas en tiempo real
+    async def rag_answer_stream(self, query: str):
+        """
+        Regresa la respuesta del sistema LLM y un bool indicando si ya termino la interaccion (True) o si continua (False).
+        """
+        # Uso de nuestra función ask previamente desarrollada. - Retrieval
+        query = query.lower()
+
+        # 7. Detección simple de fin de sesión
+        if self.follow_up_model.detect_exit_intent(query):
+            self.memoria.clear()
+            yield "Ha sido un gusto ayudarte. ¡Que tengas buen día! ¡Adiós!", True
+            return
+
+        docs = self.memoria.get_last_docs()  # revisamos si hay informacion previa
+        used_cached_docs = docs is not None and len(docs) > 0
+
+        follow_up = self.follow_up_model.is_follow_up(query, self.memoria.get_recent_turns())
+        # Verificación adicional: ¿el usuario cambió de intención a pesar de ser follow-up?
+        if follow_up and not self.follow_up_model.is_follow_up_user(query, self.memoria.get_recent_turns()):
+            if self.debug:
+                print("[DEBUG] Cambio de intención detectado. Se reinicia contexto y búsqueda.")
+            follow_up = False  # Forzamos modo nueva búsqueda
+            docs = []  # Limpiamos docs previos para no arrastrar contexto viejo
+        if self.debug:
+            print("Follow up: ", follow_up)
+
+        if not follow_up:
+            # Validamos si el usuario sigue en la misma intención, aunque no sea un follow-up directo
+            if self.should_continue_context(query, used_cached_docs):
+                follow_up = True
+                if self.debug:
+                    print(
+                        "[DEBUG] No se detectó follow-up directo, pero sí continuidad semántica. Se mantiene contexto.")
+            else:
+                resp, docs = self.retrieval.ask(query, return_docs=True, memoria=None)
+
+                if not docs:
+                    self.memoria.add_turn("user", query)
+                    self.memoria.add_turn("assistant", "No encontré información suficiente en la base.")
+                    yield "No encontré información suficiente en la base.", False
+                    return
+
+                self.memoria.set_last_docs(docs)
+                if self.debug:
+                    print("[DEBUG] Nueva búsqueda realizada, se guardan nuevos documentos.")
+                self.initial_prompt = self.INIT_PROMPT_LLAMA
+
+        else:
+            # 4. En caso de follow-up, usar los documentos previos
+            if not used_cached_docs:
+                if self.debug:
+                    print("[DEBUG] Follow-up detectado, pero no hay documentos previos.")
+                self.memoria.add_turn("user", query)
+                self.memoria.add_turn("assistant", "No tengo contexto previo suficiente.")
+                yield "¿Podrías especificar a qué unidad o tema te refieres?", False
+                return
+
+            matches = self.follow_up_model.match_sucursal_from_input(user_input=query, docs=docs)
+            if matches:
+                docs = [doc for doc, _ in matches]
+                self.memoria.set_last_docs(docs)
+                self.initial_prompt = self.DETAILS_PROMPT
+                if self.debug:
+                    print(f"[DEBUG] Se detectaron {len(matches)} coincidencias por follow-up:")
+                    for doc in docs:
+                        nombre = doc.metadata.get("nombre_oficial", "Sin nombre")
+                        municipio = doc.metadata.get("municipio", "Sin municipio")
+                        estado = doc.metadata.get("estado", "Sin estado")
+                        print(f" - {nombre} ({municipio}, {estado})")
+            else:
+                # Solo considerar cambio de intención si NO hubo match
+                is_same_topic = self.follow_up_model.is_follow_up_user(query, self.memoria.get_recent_turns())
+                if self.debug:
+                    print(f"[DEBUG] Similitud semántica entre queries: {is_same_topic}")
+                if not is_same_topic:
+                    if self.debug:
+                        print("[DEBUG] Cambio de intención detectado. Se reinicia contexto y búsqueda.")
+                    follow_up = False
+                    docs = []
+                    self.memoria.set_last_docs([])
+                else:
+                    self.initial_prompt = self.CONTINUOUS_PROMPT_LLAMA
+                    if self.debug:
+                        print(
+                            "[DEBUG] Follow-up válido sin coincidencia específica. Se mantiene el contexto actual.")
+
+        context = build_context_from_docs(docs, full=follow_up)
+
+        historial = "\n".join([f"{t['role'].title()}: {t['content']}" for t in self.memoria.get_recent_turns()])
+        context_tokens = count_tokens(context)
+        historial_tokens = count_tokens(historial)
+        self.memoria.trim_if_exceeds_tokens(context_tokens, historial_tokens)
+
+        # Armado de prompt
+        prompt_value = self.build_llama2_prompt(context=context, question=query, historial=historial)
+
+        if self.debug:
+            print("Finished Context, tokens number: ", count_tokens(prompt_value))
+
+        # Generation
+        t0 = time.perf_counter()
+        out = self.llm_model(
+            prompt=prompt_value,
+            stop=["</s>"],
+            max_tokens=512,
+            stream=True
+        )
+        t1 = time.perf_counter()
+
+        ## Debugging
+        if self.debug:
+            print("Finished invoke, time: ", t1 - t0, " s")
+            print("Prompt completo:\n", prompt_value)
+            # print("Respuesta tokens:", len(out["choices"][0]["text"].split()))
+            # print("Respuesta completa:\n", out["choices"][0]["text"])
+
+        sentence_buffer = ""
+        full_response_text = ""
+
+        for chunk in out:
+            token = chunk["choices"][0]["text"]
+            sentence_buffer += token
+
+            # Detectamos fin de oración para disparar el TTS
+            if any(punct in token for punct in [".", "!", "?", "\n"]):
+                clean_sentence = sentence_buffer.strip()
+                if clean_sentence:
+                    if self.debug:
+                        print(clean_sentence)
+                    full_response_text += " " + clean_sentence
+                    yield clean_sentence
+                    sentence_buffer = ""
+
+        # Entregar el resto si quedó algo en el buffer
+        if sentence_buffer.strip():
+            last_sentence = sentence_buffer.strip()
+            full_response_text += " " + last_sentence
+            yield last_sentence
+
+        # Actualizar memoria
+        self.memoria.add_turn("user", query)
+        self.memoria.add_turn("assistant", full_response_text.strip())
+
 
     def should_continue_context(self, query: str, used_cached_docs: bool) -> bool:
         """
@@ -214,6 +358,7 @@ class GenerationModuleLlama:
     DETAILS_PROMPT = """
     Eres un asistente telefónico estrictamente en español mexicano de Medical Life. 
     El usuario ha pedido detalles de una unidad médica específica.
+    Si lees que el cliente pide hablar con un asesor, regresa solamente: TRANSFER_CALL.
 
     Responde usando SOLO la información del contexto. No inventes.
     
@@ -226,6 +371,9 @@ class GenerationModuleLlama:
     - Información adicional si existe
 
     Estilo:
+    - Responde todo en un párrafo.
+    - No enumeres listas, escribelas directo.
+    - Responde sin puntos o doble punto.
     - Español neutro, respuesta clara y breve (4-6 líneas).
     - Tu respuesta debes escribirla solamente con letras, sin guiones o identificador, los números expresados con palabras.
     - NO te presentes. NO saludes. Inicia con una frase de confirmación como "claro!" y ve directo a los datos.
@@ -236,12 +384,16 @@ class GenerationModuleLlama:
     Eres un asistente telefónico estrictamente en español mexicano de Medical Life, empresa proveedora de servicios médicos.
     Responde SOLO usando el CONTEXTO otorgado. No inventes nada que no esté en el contexto.
     Si falta información, di: "No tenemos información de lo que estás pidiendo".
+    Si lees que el cliente pide hablar con un asesor, regresa solamente: TRANSFER_CALL.
 
     Ya estas respondiendo de mensajes previos, por lo tanto no te presentes y ve directo a la respuesta, que incluya:
     - Un parafraseo corto de la pregunta del cliente.
     - Solo las sedes que se preguntaron y que se encuentren en el contexto, indicando la información pedida por el usuario.
 
     Instrucciones de estilo:
+    - Responde todo en un párrafo.
+    - No enumeres listas, escribelas directo.
+    - Responde sin puntos o doble punto.
     - NO te presentes. NO saludes. Ve directo a los datos.
     - Responde solamente en español.
     - Si solo hay una sede, preséntala directamente, sin mencionar que no hay más.
@@ -254,6 +406,7 @@ class GenerationModuleLlama:
                         Eres un asistente telefónico estrictamente en español mexicano llamado CORA, de Medical Life, empresa proveedora de servicios médicos.
                         Responde SOLO usando el CONTEXTO otorgado. No inventes nada que no esté en el contexto.
                         Si falta información, di: "No tenemos información de lo que estás pidiendo".
+                        Si lees que el cliente pide hablar con un asesor, regresa solamente: TRANSFER_CALL.
 
                         Tu respuesta debe incluir:
                         - Una frase de confirmación como "por supuesto".
@@ -264,7 +417,10 @@ class GenerationModuleLlama:
                         Instrucciones de estilo:
                         - No incluyas presentación o tu nombre, ya que es un seguimiento de la misma conversación.
                         - Responde solamente en español.
-                        - Si hay varias sedes, enuméralas como lista (máximo 4) con nombre, municipio, estado y el servicio que se pidió.
+                        - Si hay varias sedes, escríbelas (máximo 4) con nombre, municipio, estado y el servicio que se pidió, sin enumerar.
+                        - Responde sin puntos o doble punto.
+                        - Responde todo en un párrafo.
+                        - No enumeres listas, escribelas directo.
                         - Si solo hay una sede, preséntala directamente, sin mencionar que no hay más.
                         - NO inventes nombres de sedes ni menciones genéricas como "otras sedes disponibles".
                         - Finaliza siempre preguntando si desea más información de alguna de las sedes(como horarios o ubicación exacta).
