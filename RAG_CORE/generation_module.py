@@ -60,13 +60,15 @@ class GenerationModuleLlama:
                 f"[INST] <<SYS>>{self.initial_prompt}<< / SYS >>"
                 f"# HISTORIAL: {historial}"
                 f"# CONTEXTO: {context}"
-                f"# PREGUNTA: {question}[/ INST]"
+                f"# PREGUNTA: {question}. RESPONDE EN UN SOLO PÁRRAFO, SIN LISTAS Y SIN USAR NÚMEROS (ejemplo: decir 'uno' en lugar de '1')."
+                f"[/ INST]"
             )
         else:
             return (
                 f"[INST] <<SYS>>\n{self.initial_prompt.strip()}\n<</SYS>>\n\n"
                 f"# CONTEXTO\n{context.strip()}\n\n"
-                f"# PREGUNTA\n{question.strip()}\n[/INST]\n"
+                f"# PREGUNTA\n{question.strip()}. RESPONDE EN UN SOLO PÁRRAFO, SIN LISTAS Y SIN USAR NÚMEROS (ejemplo: decir 'uno' en lugar de '1')."
+                f"[/INST]\n"
             )
 
 
@@ -114,7 +116,7 @@ class GenerationModuleLlama:
                 self.memoria.set_last_docs(docs)
                 if self.debug:
                     print("[DEBUG] Nueva búsqueda realizada, se guardan nuevos documentos.")
-                self.initial_prompt = self.INIT_PROMPT_LLAMA
+                self.initial_prompt = INIT_PROMPT_LLAMA
 
         else:
             # 4. En caso de follow-up, usar los documentos previos
@@ -129,7 +131,7 @@ class GenerationModuleLlama:
             if matches:
                 docs = [doc for doc, _ in matches]
                 self.memoria.set_last_docs(docs)
-                self.initial_prompt = self.DETAILS_PROMPT
+                self.initial_prompt = DETAILS_PROMPT
                 if self.debug:
                     print(f"[DEBUG] Se detectaron {len(matches)} coincidencias por follow-up:")
                     for doc in docs:
@@ -149,7 +151,7 @@ class GenerationModuleLlama:
                     docs = []
                     self.memoria.set_last_docs([])
                 else:
-                    self.initial_prompt = self.CONTINUOUS_PROMPT_LLAMA
+                    self.initial_prompt = CONTINUOUS_PROMPT_LLAMA
                     if self.debug:
                         print("[DEBUG] Follow-up válido sin coincidencia específica. Se mantiene el contexto actual.")
 
@@ -206,7 +208,7 @@ class GenerationModuleLlama:
         # 7. Detección simple de fin de sesión
         if self.follow_up_model.detect_exit_intent(query):
             self.memoria.clear()
-            yield "Ha sido un gusto ayudarte. ¡Que tengas buen día! ¡Adiós!", True
+            yield {"text": "Ha sido un gusto ayudarte. ¡Que tengas buen día! ¡Adiós!", "end_session": True}
             return
 
         docs = self.memoria.get_last_docs()  # revisamos si hay informacion previa
@@ -235,13 +237,13 @@ class GenerationModuleLlama:
                 if not docs:
                     self.memoria.add_turn("user", query)
                     self.memoria.add_turn("assistant", "No encontré información suficiente en la base.")
-                    yield "No encontré información suficiente en la base.", False
+                    yield {"text": "No encontré información suficiente en la base.", "end_session": False}
                     return
 
                 self.memoria.set_last_docs(docs)
                 if self.debug:
                     print("[DEBUG] Nueva búsqueda realizada, se guardan nuevos documentos.")
-                self.initial_prompt = self.INIT_PROMPT_LLAMA
+                self.initial_prompt = INIT_PROMPT_LLAMA
 
         else:
             # 4. En caso de follow-up, usar los documentos previos
@@ -250,14 +252,14 @@ class GenerationModuleLlama:
                     print("[DEBUG] Follow-up detectado, pero no hay documentos previos.")
                 self.memoria.add_turn("user", query)
                 self.memoria.add_turn("assistant", "No tengo contexto previo suficiente.")
-                yield "¿Podrías especificar a qué unidad o tema te refieres?", False
+                yield {"text": "Podrías especificar a qué unidad o tema te refieres?", "end_session": False}
                 return
 
             matches = self.follow_up_model.match_sucursal_from_input(user_input=query, docs=docs)
             if matches:
                 docs = [doc for doc, _ in matches]
                 self.memoria.set_last_docs(docs)
-                self.initial_prompt = self.DETAILS_PROMPT
+                self.initial_prompt = DETAILS_PROMPT
                 if self.debug:
                     print(f"[DEBUG] Se detectaron {len(matches)} coincidencias por follow-up:")
                     for doc in docs:
@@ -277,7 +279,7 @@ class GenerationModuleLlama:
                     docs = []
                     self.memoria.set_last_docs([])
                 else:
-                    self.initial_prompt = self.CONTINUOUS_PROMPT_LLAMA
+                    self.initial_prompt = CONTINUOUS_PROMPT_LLAMA
                     if self.debug:
                         print(
                             "[DEBUG] Follow-up válido sin coincidencia específica. Se mantiene el contexto actual.")
@@ -314,26 +316,33 @@ class GenerationModuleLlama:
 
         sentence_buffer = ""
         full_response_text = ""
+        word_count = 0
 
         for chunk in out:
             token = chunk["choices"][0]["text"]
             sentence_buffer += token
 
+            if " " in token:
+                word_count += 1
             # Detectamos fin de oración para disparar el TTS
-            if any(punct in token for punct in [".", "!", "?", "\n"]):
+            if any(punct in token for punct in [".", "!", "?", "\n", ","]) or word_count >= 8:
                 clean_sentence = sentence_buffer.strip()
                 if clean_sentence:
                     if self.debug:
                         print(clean_sentence)
+                    clean_sentence = re.sub(r'^\d+[\.\-]\s*', '', clean_sentence)
+                    # Quita asteriscos de negrita que el TTS lee como "asterisco"
+                    clean_sentence = clean_sentence.replace("*", "")
                     full_response_text += " " + clean_sentence
-                    yield clean_sentence
+                    yield {"text": clean_sentence, "end_session": False}
                     sentence_buffer = ""
+                    word_count = 0
 
         # Entregar el resto si quedó algo en el buffer
         if sentence_buffer.strip():
             last_sentence = sentence_buffer.strip()
             full_response_text += " " + last_sentence
-            yield last_sentence
+            yield {"text": last_sentence, "end_session": False}
 
         # Actualizar memoria
         self.memoria.add_turn("user", query)
@@ -354,80 +363,55 @@ class GenerationModuleLlama:
             print(f"[DEBUG] Error al validar continuidad de contexto: {e}")
             return False
 
-
-    DETAILS_PROMPT = """
-    Eres un asistente telefónico estrictamente en español mexicano de Medical Life. 
-    El usuario ha pedido detalles de una unidad médica específica.
-    Si lees que el cliente pide hablar con un asesor, regresa solamente: TRANSFER_CALL.
-
-    Responde usando SOLO la información del contexto. No inventes.
+INIT_PROMPT_LLAMA = """
+    Eres CORA, asistente de Medical Life, empresa proveedora de servicios médicos. Responde estrictamente en español mexicano.
+    Si piden hablar con asesor responde: TRANSFER_CALL. Usa SOLO el CONTEXTO. Si no hay datos di: No cuento con esa informacion.
     
-    Incluye claramente cada uno de los siguientes campos de la manera que se pide:
-    - Nombre oficial de la sede sin guiones.
-    - Dirección sin abreviaciones, interpresa acotaciones como col siendo colonia o No siendo número.
-    - Horarios expresando los días de la semana sin abreviaciones, tal como L es Lunes, V es viernes y las horas exprésalas en palabras.
-    - Teléfonos expresados con palabras explícitas de los números.
-    - Servicios
-    - Información adicional si existe
-
-    Estilo:
-    - Responde todo en un párrafo.
-    - No enumeres listas, escribelas directo.
-    - Responde sin puntos o doble punto.
-    - Español neutro, respuesta clara y breve (4-6 líneas).
-    - Tu respuesta debes escribirla solamente con letras, sin guiones o identificador, los números expresados con palabras.
-    - NO te presentes. NO saludes. Inicia con una frase de confirmación como "claro!" y ve directo a los datos.
-    - Finaliza preguntando si desea más información de alguna de las sedes o si desea terminar la comunicación.
-    """
-
-    CONTINUOUS_PROMPT_LLAMA = """
-    Eres un asistente telefónico estrictamente en español mexicano de Medical Life, empresa proveedora de servicios médicos.
-    Responde SOLO usando el CONTEXTO otorgado. No inventes nada que no esté en el contexto.
-    Si falta información, di: "No tenemos información de lo que estás pidiendo".
-    Si lees que el cliente pide hablar con un asesor, regresa solamente: TRANSFER_CALL.
-
-    Ya estas respondiendo de mensajes previos, por lo tanto no te presentes y ve directo a la respuesta, que incluya:
-    - Un parafraseo corto de la pregunta del cliente.
-    - Solo las sedes que se preguntaron y que se encuentren en el contexto, indicando la información pedida por el usuario.
-
-    Instrucciones de estilo:
-    - Responde todo en un párrafo.
-    - No enumeres listas, escribelas directo.
-    - Responde sin puntos o doble punto.
-    - NO te presentes. NO saludes. Ve directo a los datos.
-    - Responde solamente en español.
-    - Si solo hay una sede, preséntala directamente, sin mencionar que no hay más.
-    - NO inventes nombres de sedes ni menciones genéricas como "otras sedes disponibles".
+    TU RESPUESTA DEBE:
+    - No incluyas presentación o tu nombre, ya que es un seguimiento de la misma conversación.
+    - Iniciar con "Por supuesto" o "Claro".
+    - Mencionar las sedes (MAXIMO TRES) indicando nombre, municipio y estado.
+    - Si hay mas de tres sedes, mencionar cuantas mas existen y preguntar si desea conocerlas.
+    - Escribir TODO en un solo párrafo, sin guiones, sin asteriscos y sin usar números (ejemplo: decir "uno" en lugar de "1").
+    - No uses puntos ni comillas dentro del párrafo, solo al final.
+    - Usa frases cortas y directas.
+    - Finaliza siempre preguntando si desea más información de alguna de las sedes(como horarios o ubicación exacta).
     - La respuesta debe ser breve (3 a 6 líneas).
-    - Tu respuesta debes escribirla solamente con letras, sin guiones o identificador, los números expresados con palabras.
-    - Finaliza siempre preguntando si desea más información de alguna de las sedes o si desea terminar la comunicación.
+    
+    Ejemplo de estilo: Claro encontré la sede centro en querétaro y la sede norte en el municipio de monterrey para el servicio de farmacia, desea saber horarios o ubicación exacta de alguna?
     """
-    INIT_PROMPT_LLAMA = """
-                        Eres un asistente telefónico estrictamente en español mexicano llamado CORA, de Medical Life, empresa proveedora de servicios médicos.
-                        Responde SOLO usando el CONTEXTO otorgado. No inventes nada que no esté en el contexto.
-                        Si falta información, di: "No tenemos información de lo que estás pidiendo".
-                        Si lees que el cliente pide hablar con un asesor, regresa solamente: TRANSFER_CALL.
 
-                        Tu respuesta debe incluir:
-                        - Una frase de confirmación como "por supuesto".
-                        - Un parafraseo corto de la pregunta del cliente.
-                        - Solo las sedes encontradas en el contexto, indicando municipio, estado y el servicio solicitado.
-                        - La o las sedes expresalas en palabras simples de leer y con la ubicacion corta.
+DETAILS_PROMPT = """
+    Eres un asistente de Medical Life. El usuario quiere detalles de una unidad específica.
+    Si piden asesor responde: TRANSFER_CALL.
+    Responde SOLO con el CONTEXTO en un solo párrafo continuo.
+    NO te presentes. NO saludes. Inicia con una frase de confirmación como "claro!" y ve directo a los datos.
+    Finaliza preguntando si desea más información de alguna de las sedes o si desea terminar la comunicación.
+    
+    REGLAS FONÉTICAS:
+    - NOMBRES Y DIRECCIONES: Escríbelos completo. Traduce "Col." a "colonia", "No." a "número", "Av." a "avenida".
+    - NUNCA menciones el id de las sucursales.
+    - HORARIOS: Di los días completos. Ejemplo: "de lunes a viernes de nueve de la mañana a seis de la tarde".
+    - TELÉFONOS: Escribe los números con letras uno por uno (ejemplo: cinco cinco dos dos).
+    - ESTILO: Sin listas, sin puntos, sin guiones, sin abreviaciones.
+    - ESTRUCTURA: Confirmación directa con los datos y termina preguntando si necesita algo más.
+    
+    Ejemplo: La sede se encuentra en la colonia centro número diez y su teléfono es cinco cinco uno dos tres cuatro, desea más información o quiere terminar la llamada?
+    """
 
-                        Instrucciones de estilo:
-                        - No incluyas presentación o tu nombre, ya que es un seguimiento de la misma conversación.
-                        - Responde solamente en español.
-                        - Si hay varias sedes, escríbelas (máximo 4) con nombre, municipio, estado y el servicio que se pidió, sin enumerar.
-                        - Responde sin puntos o doble punto.
-                        - Responde todo en un párrafo.
-                        - No enumeres listas, escribelas directo.
-                        - Si solo hay una sede, preséntala directamente, sin mencionar que no hay más.
-                        - NO inventes nombres de sedes ni menciones genéricas como "otras sedes disponibles".
-                        - Finaliza siempre preguntando si desea más información de alguna de las sedes(como horarios o ubicación exacta).
-                        - La respuesta debe ser breve (3 a 6 líneas).
-                        - Tu respuesta debes escribirla solamente con letras, sin guiones o identificador, los números expresados con palabras.
-                        - Al mencionar las sedes, menciona el nombre y ubicacion corta, no incluyas el id o guiones.
-                        """
+CONTINUOUS_PROMPT_LLAMA = """
+    Eres CORA de Medical Life. Responde SOLO con el CONTEXTO. Si piden asesor responde: TRANSFER_CALL.
+    Estas en una conversación fluida, ve directo al grano, dando un parafraseo corto de la pregunta del cliente. 
+    
+    INSTRUCCIONES:
+    - Responde en un solo párrafo de máximo tres líneas.
+    - Prohibido usar listas, viñetas, guiones o caracteres especiales.
+    - Escribe números con letras.
+    - Si falta información di: No tengo esos datos por ahora.
+    - Finaliza con una pregunta corta como: Alguna otra duda o desea terminar.
+    
+    Ejemplo: Encontré la información de farmacia en la sede de campeche municipio de escarcega desea saber algo más de esta unidad o prefiere terminar
+    """
 
 def build_context_from_docs(docs, full=False):
     parts = []
@@ -639,11 +623,11 @@ class FollowUpDetector:
         # comparación semántica
         ejemplos_salida = [
             "ya terminé", "eso es todo", "puedes cortar la llamada", "terminamos", "no tengo mas preguntas", "adiós",
-            "es todo", "seria todo",
+            "es todo", "seria todo", "no necesito nada", "nada",
         ]
         emb_user = self.model.embeddings.embed_query(user_input)
         emb_refs = [self.model.embeddings.embed_query(e) for e in ejemplos_salida]
         scores = [cosine_similarity([emb_user], [e])[0][0] for e in emb_refs]
         if self.debug:
-            print("[DEBUG] Nivel de deteccion de finalizacion: ", scores)
+            print("[DEBUG] Nivel de deteccion de finalizacion: ", scores, " Fin: ", max(scores) >= 0.58)
         return max(scores) >= 0.58  # umbral ajustable

@@ -94,9 +94,6 @@ FRAME_MS = 20
 FRAME_SAMPLES_8K = int(TWILIO_SR * (FRAME_MS / 1000.0))  # 160 samples @ 8kHz
 FRAME_BYTES_PCM16 = FRAME_SAMPLES_8K * SAMPLE_WIDTH_BYTES  # 320 bytes PCM16
 
-# TTS output pacing
-SEND_REALTIME = True  # if True, pace ~20ms per frame for more natural streaming
-
 LLM_MODEL_FILE = "../HF_Agents/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 HF_TOKEN = os.getenv("HF_TOKEN")
 
@@ -106,12 +103,12 @@ VECTOR_MODEL_NAME = 'jinaai/jina-embeddings-v2-base-es'
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
-gpu_layers = 20
-config = {'max_new_tokens': 256, 'context_length': 1800, 'temperature': 0.45, "gpu_layers": gpu_layers,
+gpu_layers = -1 # 20 a 30 funcionan en nuestra GPU NVIDIA RTX4090 8 GB, -1 settea a GPU
+config = {'max_new_tokens': 256, 'context_length': 2048, 'temperature': 0.45, "gpu_layers": gpu_layers,
                           "threads": os.cpu_count()}
 
 
-DEBUG = False
+DEBUG = True
 
 
 app = FastAPI(title="Twilio MVP Voice Agent (XTTS + faster-whisper)")
@@ -122,7 +119,7 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Singletons (for MVP)
 ASR = AsrEngine(model_size="medium", device="cuda" if torch.cuda.is_available() else "cpu")
-TTS_ENGINE = Speaker(engine="XTTS", device="cuda" if torch.cuda.is_available() else "cpu")
+TTS_ENGINE = Speaker(engine="TTS", device="cuda" if torch.cuda.is_available() else "cpu")
 """
 Augmentation and Generation Portion
 """
@@ -135,12 +132,14 @@ llm_model = Llama(model_path=LLM_MODEL_FILE,
                          # The number of CPU threads to use, tailor to your system and the resulting performance
                          n_gpu_layers=gpu_layers,
                          temperature=config["temperature"],
+                         n_batch=512,
                          use_mlock=False,
                          use_mmap=True,
+                         f16_kv = True,
                          verbose=False
                          )
 llm_module = GenerationModuleLlama(llm_model)
-llm_module.initialize(initial_prompt=MESSAGES.INIT_PROMPT_LLAMA, retrieval=retrieval_module, debug=False)
+llm_module.initialize(initial_prompt=MESSAGES.INIT_PROMPT_LLAMA, retrieval=retrieval_module, debug=DEBUG)
 
 
 # -----------------------------
@@ -152,13 +151,6 @@ WELCOME_CAMPAING = [MESSAGES.MSG_1, MESSAGES.MSG_2, MESSAGES.MSG_3, MESSAGES.MID
 
 GREETING_MSG = ("¡Hola! Mi nombre es Cora, soy el asistente de Medical Laif para resolver tus dudas y es un placer"
                 " atender tu llamada. Dime, ¿tienes alguna duda sobre un servicio o localización de algún centro?")
-
-QUESTION_1 = "Para comenzar, dime por favor en que ciudad o municipio te encuentras."
-QUESTION_2 = "Gracias. Ahora dime, por favor, qué tipo de servicio estás buscando. Por ejemplo, consulta general o dentista."
-GOODBYE_TEXT = (
-    "Perfecto. Con esta información es suficiente para la prueba. "
-    "Muchas gracias por tu tiempo. Que tengas un excelente día. Hasta luego."
-)
 
 
 # -----------------------------
@@ -315,16 +307,10 @@ class TurnDetector:
 def xtts_tts_f32(text: str, language: str = "es") -> Tuple[np.ndarray, int]:
     """
     Genera el TTS a Wav para enviarlo a reproducir en Twilio (wav_f32, sr).
+    Se genera la funcion para el run en paralelo
     """
-    # Coqui regresa un 1D numpy array (float32) a in sample rate usualmente de 24000
-    wav = TTS_ENGINE.tts.tts(text=text, speaker_wav=speaker_wav_path, language=language)
-    # Forzar numpy float32
-    wav = np.asarray(wav, dtype=np.float32)
-    sr = getattr(getattr(TTS_ENGINE.tts, "synthesizer", None), "output_sample_rate", None)
-    if not sr:
-        # Coqui TTS generally uses 24000 for XTTS v2
-        sr = 22050
-    return wav, int(sr)
+    return TTS_ENGINE.tts_to_wav(text, language)
+
 
 
 # -----------------------------
@@ -685,30 +671,38 @@ async def twilio_ws(ws: WebSocket):
 
         # --- PARTE 2: CONSUMO DEL LLM STREAM ---
         full_response_text = ""
-
+        end_flag = False
         # Creamos un bloque try para manejar la interrupción total si fuera necesario
-        async for sentence in llm_module.rag_answer_stream(text):
+        async for response in llm_module.rag_answer_stream(text):
+            sentence = response['text']
             if not sentence:
                 continue
 
-            # Lógica de Transferencia (Handoff)
-            if "TRANSFER_CALL" in sentence:
+            if response['end_session']:
+                print("[DEBUG] Terminando sesion")
+                full_response_text += " Entendido, muchas gracias por tu llamada, adios."
+                return
+            elif "TRANSFER_CALL" in sentence:
+                if DEBUG:
+                    print("[DEBUG] Transfiriendo a un asesor humano")
                 if call_sid:
-                    await start_speaking("Entendido, lo comunico con un asesor.", is_partial=False)
+                    await start_speaking("Entendido, lo comunico con un asesor humano.", is_partial=False)
                     await transfer_to_human(call_sid)
                 await ws.close()
                 return
-
-            # Hablamos la oración. Usamos is_partial=True para que se encole/procese fluído.
-            await start_speaking(sentence, is_partial=True)
-            full_response_text += " " + sentence
-            if DEBUG:
-                print("[ASR] sentence text:", sentence)
+            else:
+                # Hablamos la oración. Usamos is_partial=True para que se encole/procese fluído.
+                await start_speaking(sentence, is_partial=True)
+                full_response_text += " " + sentence
+                if DEBUG:
+                    print("[ASR] sentence text:", sentence)
 
         # --- PARTE 3: GESTIÓN DE ESTADOS Y CIERRE ---
         turn_idx += 1
+        if DEBUG:
+            print("[DEBUG] Turno en cuestion: ", turn_idx)
 
-        if "adiós" in full_response_text.lower() or turn_idx > 5:
+        if "adiós" in full_response_text.lower() or turn_idx > 5 or end_flag:
             # Esperamos a que termine de hablar antes de colgar
             if bot_task and not bot_task.done():
                 try:
@@ -815,7 +809,7 @@ async def twilio_ws(ws: WebSocket):
                 print("TWILIO WS STOP")
                 break
 
-    except Exception:
+    except Exception as e:
         # Logs de error
         print(f"[CRITICAL] Error en loop de Watchdog: {e}")
         pass

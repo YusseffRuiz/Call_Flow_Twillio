@@ -576,11 +576,11 @@ class RetrievalModule:
             line = (
                 f"• {meta.get('id', 'N/A')} — {meta.get('municipio', 'N/A')}, {meta.get('estado', 'N/A')} | "
                 f"{meta.get('direccion_corta', 'N/A')} | Horario: {meta.get('horarios_texto', 'No disponible')} "
-                f"| Tel: {meta.get('telefono', 'No disponible')} | Horario de Comidas: {meta['comidas']} | "
+                f"| Tel: {meta.get('telefono', 'No disponible')} | Horario de Comidas: {meta.get('comidas', 'No disponible')} | "
                 f"Servicios: {', '.join(meta.get('servicios_lista', [])) or 'Consultar en sede'} | "
                 f"Consulta: {meta.get('costo_consulta') or 'Consultar en sede'} | "
                 f"Medicamentos: {meta.get('costo_medicamentos') or 'Consultar en sede'} "
-                f"Datos sobre los médicos extra: {meta.get('datos_extras_medicos')}"
+                f"Datos sobre los médicos extra: {meta.get('datos_extras_medicos', 'No disponible')}"
             )
             if meta.get("nota_regla"):
                 line += f" — {meta['nota_regla']}"

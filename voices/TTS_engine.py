@@ -1,6 +1,7 @@
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from TTS.utils.radam import RAdam
 import torch.serialization
@@ -13,7 +14,7 @@ import soundfile as sf
 
 
 # model_name = "tts_models/es/mai/tacotron2-DDC"
-# model_name = "tts_models/en/ljspeech/glow-tts"
+# model_name = "tts_models/en/ljspeech/glow-tts" # Ingles
 clone_model = "tts_models/multilingual/multi-dataset/xtts_v2" # usado para clonacion de voz
 # speaker_wav_path = "PruebaVozAdan.wav" # Voz base, cambiar con respecto a cual quieras usar
 speaker_wav_path = "voices/Gil.wav" # Voz base, cambiar con respecto a cual quieras usar
@@ -28,10 +29,13 @@ class Speaker:
         if engine == "TTS":
             torch.serialization.add_safe_globals([RAdam])
             self.tts = TTS(model_name).to(device)
+            self.sr = 22050
         elif engine == "KOKORO":
             self.tts = KPipeline(lang_code='e')
+            self.sr = 24000
         elif engine == "XTTS":
             self.tts = TTS(clone_model).to(device)
+            self.sr = 24000
         else:
             print("Only TTS and KOKORO are supported")
 
@@ -40,16 +44,29 @@ class Speaker:
     def speak(self, text):
         if self.engine == "TTS":
             wav = self.tts.tts(text)
-            sd.play(wav, samplerate=22050)
+            sd.play(wav, samplerate=self.sr)
             sd.wait()
         elif self.engine == "KOKORO":
             generator = self.tts(text, voice=kokoro_voice)
             for i, (gs, ps, audio) in enumerate(generator):
                 audio = audio.detach().cpu().numpy()
-                sd.play(audio, samplerate=24000)
+                sd.play(audio, samplerate=self.sr)
                 sd.wait()
         else:
             raise ValueError("Not Supported Engine")
+
+    def tts_to_wav(self, text, language="es"):
+        if self.engine == "TTS":
+            wav = self.tts.tts(text=text)
+        elif self.engine == "KOKORO":
+            wav = self.tts.tts(text=text, voice=kokoro_voice)
+        elif self.engine == "XTTS":
+            wav = self.tts.tts(text=text, speaker_wav=speaker_wav_path, language=language)
+        else:
+            raise ValueError("Not Supported Engine")
+        # Forzar numpy float32
+        wav = np.asarray(wav, dtype=np.float32)
+        return wav, self.sr
 
     def save_dialog(self, text, path="audio/"):
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -61,7 +78,7 @@ class Speaker:
             generator = self.tts(text, voice=kokoro_voice)
             for i, (gs, ps, audio) in enumerate(generator):
                 audio = audio.detach().cpu().numpy()
-                sf.write(out_path, audio, samplerate=24000)
+                sf.write(out_path, audio, samplerate=self.sr)
         elif self.engine == "XTTS":
             self.tts.tts_to_file(
                 text=text, speaker_wav=speaker_wav_path, language="es", file_path=out_path)
@@ -96,3 +113,4 @@ class Speaker:
         data, samplerate = sf.read(path, dtype="float32")
         sd.play(data, samplerate=samplerate)
         sd.wait()
+
