@@ -538,7 +538,7 @@ async def twilio_ws(ws: WebSocket):
             # Manejo de Barge-in: si el usuario interrumpe, se detiene la síntesis
             raise
 
-    # Migrando, a procesamiento paralelo
+    # Migrando, a procesamiento paralelo, no usar de momento. Guardando para comparativa.
     async def speak_text(text: str):
         """Generate XTTS audio and stream to Twilio."""
         wav, sr = xtts_tts_f32(text=text, language=LANGUAGE)
@@ -598,6 +598,7 @@ async def twilio_ws(ws: WebSocket):
         bot_task = new_task  # Para el control global de cancelación
         last_tts_task = new_task  # Para el encadenamiento del stream
 
+    # Funcion guardada para comparativa, no usar de momento.
     async def handle_user_turn(pcm16_turn: bytes, call_sid: str):
         """ASR -> agent reply -> next prompt / goodbye."""
         nonlocal turn_idx
@@ -722,9 +723,23 @@ async def twilio_ws(ws: WebSocket):
     try:
         # Start: greeting + question 1
         while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-            event = msg.get("event")
+            try:
+                # Usamos wait_for para que el socket no se quede bloqueado infinitamente
+                # Si en 1 segundo no llega nada de Twilio (ej. Mute total), verificamos el estado
+                raw = await asyncio.wait_for(ws.receive_text(), timeout=1.0)
+                msg = json.loads(raw)
+                event = msg.get("event")
+            except asyncio.TimeoutError:
+                # --- WATCHDOG ---
+                # Si el detector escuchó algo pero se quedó atorado por el mute
+                # (no se procesa, porque el sistema espera recibir cierto nivel de ruido.)
+                if detector._heard_speech and len(detector._frames) > 0:
+                    if DEBUG:
+                        print("[WATCHDOG] Inactividad detectada (Mute). Forzando cierre de turno...")
+                    audio = b"".join(detector._frames)
+                    detector.reset()
+                    await handle_user_turn_stream(audio, call_sid)
+                continue
 
             if event == "start":
                 stream_sid = msg["start"]["streamSid"]
@@ -756,16 +771,6 @@ async def twilio_ws(ws: WebSocket):
                     continue
 
                 r = rms_pcm16(frame_bytes)
-                # print("[IN] rms:", r, "bot_speaking:", bot_speaking, "pending:", bot_pending)
-
-                # if (now - last_bot_end_ts) * 1000.0 < POST_TTS_IGNORE_MS:
-                #     detector.reset()
-                #     continue
-
-                # Si aún no empezó a streamear el bot (está generando TTS), ignora audio entrante
-                # if bot_pending and not bot_started_streaming:
-                #     # detector.reset()
-                #     continue
 
                 # Barge-in: si el bot esta hablando e interrumpen, se limpia y se vuelve a escuchar.
                 if bot_speaking:
@@ -811,7 +816,8 @@ async def twilio_ws(ws: WebSocket):
                 break
 
     except Exception:
-        # Keep logs minimal for MVP; add structured logging later.
+        # Logs de error
+        print(f"[CRITICAL] Error en loop de Watchdog: {e}")
         pass
     finally:
         # Cancel bot task if still running
