@@ -32,7 +32,7 @@ def count_tokens(text: str) -> int:
 
 
 class GenerationModuleLlama:
-    def __init__(self, llm_model):# , device="cuda" if torch.cuda.is_available() else "cpu", configFile = None):
+    def __init__(self, llm_model, max_tokens=2048):# , device="cuda" if torch.cuda.is_available() else "cpu", configFile = None):
         """
         :param model_name: model name or model path
         :param device: if gpu his available
@@ -42,7 +42,6 @@ class GenerationModuleLlama:
         self.initial_prompt = None
         self.retrieval = None
         self.follow_up_model = None
-        max_tokens = 2048
         self.llm_model = llm_model
         self.memoria = ConversationalMemory(max_tokens=max_tokens)
         # print(f"Module Created!, gpu layers: {gpu_layers}.")
@@ -60,14 +59,14 @@ class GenerationModuleLlama:
                 f"[INST] <<SYS>>{self.initial_prompt}<< / SYS >>"
                 f"# HISTORIAL: {historial}"
                 f"# CONTEXTO: {context}"
-                f"# PREGUNTA: {question}. RESPONDE EN UN SOLO PÁRRAFO, SIN LISTAS Y SIN USAR NÚMEROS (ejemplo: decir 'uno' en lugar de '1')."
+                f"# PREGUNTA: {question}. RECUERDA: UN SOLO PÁRRAFO, NADA DE LISTAS, NADA DE NÚMEROS. (ejemplo: decir 'uno' en lugar de '1')."
                 f"[/ INST]"
             )
         else:
             return (
                 f"[INST] <<SYS>>\n{self.initial_prompt.strip()}\n<</SYS>>\n\n"
                 f"# CONTEXTO\n{context.strip()}\n\n"
-                f"# PREGUNTA\n{question.strip()}. RESPONDE EN UN SOLO PÁRRAFO, SIN LISTAS Y SIN USAR NÚMEROS (ejemplo: decir 'uno' en lugar de '1')."
+                f"# PREGUNTA\n{question.strip()}. RECUERDA: UN SOLO PÁRRAFO, NADA DE LISTAS, NADA DE NÚMEROS. (ejemplo: decir 'uno' en lugar de '1')."
                 f"[/INST]\n"
             )
 
@@ -421,7 +420,8 @@ def build_context_from_docs(docs, full=False):
             snippet = d.page_content
             parts.append(f"{snippet}. ")
         else:
-            parts.append(f"{m['id']} — {m['municipio']}, {m['estado']} | Servicios: {', '.join(m.get('servicios_lista', []))}")
+            # parts.append(f"{m['id']} — {m['municipio']}, {m['estado']} | Servicios: {', '.join(m.get('servicios_lista', []))}")
+            parts.append(f"{m['municipio']}, {m['estado']} | Servicios: {', '.join(m.get('servicios_lista', []))}")
     return "\n---\n".join(parts)
 
 

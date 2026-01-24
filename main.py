@@ -440,6 +440,7 @@ async def twilio_ws(ws: WebSocket):
     barge_speech_hits = 0
     BARGE_MIN_HITS = 3  # 3*20ms = 60ms de voz consistente
     last_tts_task = None
+    processing_turn = False
 
     ws_send_lock = asyncio.Lock()
 
@@ -709,10 +710,26 @@ async def twilio_ws(ws: WebSocket):
                     await bot_task
                 except asyncio.CancelledError:
                     pass
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(1.5)
             if DEBUG:
                 print("[WS] Cerrando conexión por fin de turno o despedida.")
             await ws.close()
+
+    async def safe_handle_turn(audio: bytes, sid: str):
+        nonlocal processing_turn, turn_idx
+        if processing_turn:
+            return
+
+        processing_turn = True
+        try:
+            # Procesamos el turno (ASR -> RAG -> LLM -> TTS)
+            await handle_user_turn_stream(audio, sid)
+        except Exception as e:
+            print(f"[ERROR] Fallo en el flujo del turno: {e}")
+            # Opcional: Enviar un mensaje de error vocal al usuario
+            await start_speaking("Lo siento, tuve un problema técnico. ¿Podrías repetir eso?", is_partial=False)
+        finally:
+            processing_turn = False
 
     try:
         # Start: greeting + question 1
@@ -727,12 +744,13 @@ async def twilio_ws(ws: WebSocket):
                 # --- WATCHDOG ---
                 # Si el detector escuchó algo pero se quedó atorado por el mute
                 # (no se procesa, porque el sistema espera recibir cierto nivel de ruido.)
-                if detector._heard_speech and len(detector._frames) > 0:
+                if detector._heard_speech and not processing_turn and not bot_speaking:
                     if DEBUG:
-                        print("[WATCHDOG] Inactividad detectada (Mute). Forzando cierre de turno...")
+                        print("[WATCHDOG] Inactividad (Mute) detectada. Forzando disparo...")
                     audio = b"".join(detector._frames)
                     detector.reset()
-                    await handle_user_turn_stream(audio, call_sid)
+                    # Usamos create_task para no bloquear el loop del socket
+                    asyncio.create_task(safe_handle_turn(audio, call_sid))
                 continue
 
             if event == "start":
@@ -747,10 +765,10 @@ async def twilio_ws(ws: WebSocket):
                 continue
 
             if event == "media":
-                if not stream_sid:
+                if not stream_sid or processing_turn:
                     # ignore until start arrives
                     continue
-                now = time.perf_counter()
+
                 if DEBUG:
                     print("[DEBUG] Starting second turn")
 
@@ -772,21 +790,20 @@ async def twilio_ws(ws: WebSocket):
                         # gate por RMS para no disparar por ruido
                         if r > 350 and detector.vad.is_speech(frame_bytes, TWILIO_SR):
                             barge_speech_hits += 1
+                            if barge_speech_hits >= BARGE_MIN_HITS:
+                                await send_clear()
+                                await cancel_bot()
+                                detector.reset()
+                                barge_speech_hits = 0
                             if DEBUG:
                                 print("[BARGE-IN] Voz detectada mientras bot habla")
                         else:
                             barge_speech_hits = max(0, barge_speech_hits - 1)
+                        continue
 
-                        if barge_speech_hits >= BARGE_MIN_HITS:
-                            await send_clear()
-                            await cancel_bot()
-                            detector.reset()
-                            barge_speech_hits = 0
-                        else:
-                            # si no es speech, ignora mientras bot habla
-                            continue
                     except Exception:
                         continue
+
                 if r > 100 and DEBUG:  # Solo printea si hay algo de ruido
                     print(f"[SENSOR] RMS: {int(r)} | VAD: {detector.vad.is_speech(frame_bytes, TWILIO_SR)} | Speaking: {bot_speaking}")
                 finished, turn_audio = detector.add_frame(frame_bytes)
@@ -794,13 +811,12 @@ async def twilio_ws(ws: WebSocket):
                 if finished and DEBUG:
                     print(f"[VAD] Turno finalizado. Longitud audio: {len(turn_audio) if turn_audio else 0}")
 
-                if finished and turn_audio:
+                if finished and turn_audio and not processing_turn:
                     # opcional: descarta turnos ultra cortos (<0.4s)
-                    if len(turn_audio) < int(0.4 * TWILIO_SR * 2):
-                        continue
-                    if DEBUG:
-                        print("[DEBUG] Starting handler")
-                    await handle_user_turn_stream(turn_audio, call_sid)
+                    if len(turn_audio) > int(0.4 * TWILIO_SR * 2):
+                        if DEBUG:
+                            print("[DEBUG] Starting handler")
+                        asyncio.create_task(safe_handle_turn(turn_audio, call_sid))
                     if DEBUG:
                         print("[OUT] Turn: ", turn_idx, "finished:", finished)
                 continue
@@ -811,8 +827,7 @@ async def twilio_ws(ws: WebSocket):
 
     except Exception as e:
         # Logs de error
-        print(f"[CRITICAL] Error en loop de Watchdog: {e}")
-        pass
+        print(f"[CRITICAL] Error en loop de WebSocket: {type(e).__name__} - {e}")
     finally:
         # Cancel bot task if still running
         if bot_task and not bot_task.done():
