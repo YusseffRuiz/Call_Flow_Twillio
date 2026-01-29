@@ -1,35 +1,12 @@
 from __future__ import annotations
-
-import asyncio
-import base64
-import json
 import os
-import audioop
-import re
-import tempfile
-import time
-import uuid
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
-import soundfile as sf
-
-import numpy as np
-import webrtcvad
-import torchaudio
-import torch
 from dotenv import load_dotenv
-
-from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import Response, JSONResponse
 from llama_cpp import Llama
-from twilio.rest import Client
 
 
 # Your existing modules (from your repo)
-from AudioTranscription.ASREngine import AsrEngine
 from RAG_CORE.generation_module import GenerationModuleLlama
 from RAG_CORE.retrieval_module import RetrievalModule
-from voices.TTS_engine import Speaker, speaker_wav_path  # uses XTTS + speaker_wav_path
 import campaign_data.utils_script as MESSAGES
 load_dotenv("Documents/keys.env")
 # Language
@@ -58,6 +35,7 @@ GREETING_MSG = ("¡Hola! Mi nombre es Cora, soy el asistente de Medical Laif par
 
 
 def flow(llm_model=None):
+    print("buen día, comenzamos con las pruebas")
     while True:
         try:
            pregunta = input("👤 Usuario: ").strip()
@@ -79,7 +57,7 @@ def flow(llm_model=None):
 
 def main():
     gpu_layers = -1  # 20 a 30 funcionan en nuestra GPU NVIDIA RTX4090 8 GB, -1 settea a GPU
-    config = {'max_new_tokens': 256, 'context_length': 1600, 'temperature': 0.45, "gpu_layers": gpu_layers,
+    config = {'max_new_tokens': 256, 'context_length': 2500, 'temperature': 0.45, "gpu_layers": gpu_layers,
               "threads": os.cpu_count()}
 
     DEBUG = True
@@ -104,7 +82,8 @@ def main():
                       verbose=False
                       )
     llm_module = GenerationModuleLlama(llm_model)
-    llm_module.initialize(initial_prompt=MESSAGES.INIT_PROMPT_LLAMA, retrieval=retrieval_module, debug=DEBUG)
+    llm_module.initialize(initial_prompt=MESSAGES.INIT_PROMPT_LLAMA, retrieval=retrieval_module, debug=DEBUG,
+                          max_tokens=config["context_length"]/2)
 
     flow(llm_module)
 
