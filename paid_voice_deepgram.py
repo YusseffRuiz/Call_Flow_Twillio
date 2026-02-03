@@ -1,7 +1,7 @@
 import asyncio
 
 from dotenv import load_dotenv
-from voices.TTS_engine import TextToSpeech
+from voices.TTS_engine import Speaker
 from llama_cpp import Llama
 import os
 from RAG_CORE.generation_module import GenerationModuleLlama
@@ -43,7 +43,7 @@ VECTOR_MODEL_NAME = 'jinaai/jina-embeddings-v2-base-es'
 class ConversationManager:
     async def main(self, llm_model=None):
         # Loop indefinitely until "goodbye" is detected
-        tts = TextToSpeech(dg_api_key=DG_API_KEY)
+        tts = Speaker(engine="DG", dg_api_key=DG_API_KEY)
         tts.speak("¡Hola! Medical Laif, Cora Pruebas de Velocidad. Hazme las preguntas que tengas")
         while True:
             ## Anotar Pregunta

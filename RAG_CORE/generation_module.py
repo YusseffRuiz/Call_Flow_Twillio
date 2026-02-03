@@ -329,7 +329,7 @@ class GenerationModuleLlama:
             if " " in token:
                 word_count += 1
             # Detectamos fin de oración para disparar el TTS
-            if any(punct in token for punct in [".", "!", "?", "\n", ","]) or word_count >= 8:
+            if any(punct in token for punct in [".", "!", "?", "\n"]):
                 clean_sentence = sentence_buffer.strip()
                 if clean_sentence:
                     if self.debug:
@@ -380,6 +380,7 @@ INIT_PROMPT_LLAMA = """
     - Escribir TODO en un solo párrafo, sin guiones, sin asteriscos y sin usar números (ejemplo: decir "uno" en lugar de "1").
     - No uses puntos ni comillas dentro del párrafo, solo al final.
     - Usa frases cortas y directas.
+    - No realices abreviaciones en estados o ciudades (ejemplo: si dice "edo. de Mexico", cambiar a "estado de mexico").
     - Finaliza siempre preguntando si desea más información de alguna de las sedes(como horarios o ubicación exacta).
     - La respuesta debe ser breve (3 a 6 líneas).
 
@@ -396,6 +397,7 @@ DETAILS_PROMPT = """
     REGLAS FONÉTICAS:
     - NOMBRES Y DIRECCIONES: Escríbelos completo. Traduce "Col." a "colonia", "No." a "número", "Av." a "avenida".
     - NUNCA menciones el id de las sucursales.
+    - No realices abreviaciones en estados o ciudades (ejemplo: si dice "edo. de Mexico", cambiar a "estado de mexico").
     - HORARIOS: Di los días completos. Ejemplo: "de lunes a viernes de nueve de la mañana a seis de la tarde".
     - TELÉFONOS: Escribe los números con letras uno por uno (ejemplo: cinco cinco dos dos).
     - ESTILO: Sin listas, sin puntos, sin guiones, sin abreviaciones.
@@ -412,6 +414,7 @@ CONTINUOUS_PROMPT_LLAMA = """
     - Responde en un solo párrafo de máximo tres líneas.
     - Prohibido usar listas, viñetas, guiones o caracteres especiales.
     - Escribe números con letras.
+    - No realices abreviaciones en estados o ciudades (ejemplo: si dice "edo. de Mexico", cambiar a "estado de mexico").
     - Si falta información di: No tengo esos datos por ahora.
     - Finaliza con una pregunta corta como: Alguna otra duda o desea terminar.
 

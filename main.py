@@ -33,7 +33,6 @@ import base64
 import json
 import os
 import audioop
-import re
 import tempfile
 import time
 import uuid
@@ -96,6 +95,9 @@ FRAME_BYTES_PCM16 = FRAME_SAMPLES_8K * SAMPLE_WIDTH_BYTES  # 320 bytes PCM16
 
 LLM_MODEL_FILE = "../HF_Agents/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 HF_TOKEN = os.getenv("HF_TOKEN")
+DG_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+if not DG_API_KEY:
+    raise Exception("DEEPGRAM_API_KEY not found")
 
 MEDICAL_EXTENDED = "Documents/medical_life_real.xlsx"
 
@@ -119,7 +121,7 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Singletons (for MVP)
 ASR = AsrEngine(model_size="medium", device="cuda" if torch.cuda.is_available() else "cpu")
-TTS_ENGINE = Speaker(engine="TTS", device="cuda" if torch.cuda.is_available() else "cpu")
+TTS_ENGINE = Speaker(engine="DG", dg_api_key=DG_API_KEY, device="cuda" if torch.cuda.is_available() else "cpu")
 """
 Augmentation and Generation Portion
 """
@@ -433,10 +435,9 @@ async def twilio_ws(ws: WebSocket):
     bot_task: Optional[asyncio.Task] = None
     bot_speaking = False
     bot_pending = False
+    last_bot_end_ts = 0.0
     bot_started_streaming = False
     turn_idx = 0
-    last_bot_end_ts = 0.0
-    POST_TTS_IGNORE_MS = 800
     barge_speech_hits = 0
     BARGE_MIN_HITS = 3  # 3*20ms = 60ms de voz consistente
     last_tts_task = None
