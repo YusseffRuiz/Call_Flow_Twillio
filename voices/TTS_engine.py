@@ -2,13 +2,13 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pyaudio
+import requests
 import torch
 from TTS.utils.radam import RAdam
 import torch.serialization
 from TTS.api import TTS
 import sounddevice as sd
-
-
 from kokoro import KPipeline
 import soundfile as sf
 
@@ -21,10 +21,11 @@ speaker_wav_path = "voices/Gil.wav" # Voz base, cambiar con respecto a cual quie
 model_name = "tts_models/es/css10/vits"
 # model_name = "tts_models/multilingual/multi-dataset/your_tts"
 kokoro_voice = 'ef_dora'
+DG_MODEL = "aura-2-estrella-es"
 
 
 class Speaker:
-    def __init__(self, engine="TTS", device= "cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, engine="XTTS", dg_api_key=None, device= "cuda" if torch.cuda.is_available() else "cpu"):
         self.engine = engine
         if engine == "TTS":
             torch.serialization.add_safe_globals([RAdam])
@@ -36,6 +37,11 @@ class Speaker:
         elif engine == "XTTS":
             self.tts = TTS(clone_model).to(device)
             self.sr = 24000
+        elif engine == "DG":
+            self.tts = TTS(clone_model).to(device)
+            self.sr = 24000
+            self.dg_api_key = dg_api_key
+            self.MODEL_NAME = DG_MODEL  #
         else:
             print("Only TTS and KOKORO are supported")
 
@@ -52,6 +58,50 @@ class Speaker:
                 audio = audio.detach().cpu().numpy()
                 sd.play(audio, samplerate=self.sr)
                 sd.wait()
+        elif self.engine == "DG":
+            # Configuramos la URL para audio crudo (linear16)
+            DEEPGRAM_URL = f"https://api.deepgram.com/v1/speak?model={self.MODEL_NAME}&encoding=linear16&sample_rate={self.SAMPLE_RATE}"
+
+            headers = {
+                "Authorization": f"Token {self.dg_api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {"text": text}
+
+            # Abrimos el stream de salida de la laptop
+            output_stream = self.p.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self.SAMPLE_RATE,
+                output=True
+            )
+
+            start_time = time.time()
+            first_byte_received = False
+
+            try:
+                with requests.post(DEEPGRAM_URL, stream=True, headers=headers, json=payload) as r:
+                    if r.status_code != 200:
+                        print(f"❌ Error API: {r.text}")
+                        return
+
+                    # Leemos el stream por trozos
+                    for chunk in r.iter_content(chunk_size=1024):
+                        if chunk:
+                            if not first_byte_received:
+                                ttfb = int((time.time() - start_time) * 1000)
+                                print(f"⚡ Latencia PyAudio (TTFB): {ttfb}ms")
+                                first_byte_received = True
+
+                            # Enviamos el chunk directamente a las bocinas
+                            output_stream.write(chunk)
+
+            except Exception as e:
+                print(f"💥 Error en reproducción: {e}")
+            finally:
+                # Esperamos a que termine de sonar y cerramos el stream del turno
+                output_stream.stop_stream()
+                output_stream.close()
         else:
             raise ValueError("Not Supported Engine")
 
@@ -62,6 +112,8 @@ class Speaker:
             wav = self.tts.tts(text=text, voice=kokoro_voice)
         elif self.engine == "XTTS":
             wav = self.tts.tts(text=text, speaker_wav=speaker_wav_path, language=language)
+        elif self.engine == "DG":
+            print("Yet to be implemented")
         else:
             raise ValueError("Not Supported Engine")
         # Forzar numpy float32
@@ -114,3 +166,69 @@ class Speaker:
         sd.play(data, samplerate=samplerate)
         sd.wait()
 
+    def close(self):
+        """Llamar al cerrar la aplicación"""
+        if self.engine == "DG":
+            self.p.terminate()
+        else:
+            print("Not implemented for this engine")
+
+class TextToSpeech:
+
+    def __init__(self, dg_api_key: str, model_name="aura-2-estrella-es"):
+        self.dg_api_key = dg_api_key
+        self.MODEL_NAME = model_name  # Example model name, change as needed
+        # Inicializamos PyAudio una sola vez para eficiencia
+        self.p = pyaudio.PyAudio()
+        self.SAMPLE_RATE = 24000
+
+
+    def speak(self, text):
+        # Configuramos la URL para audio crudo (linear16)
+        DEEPGRAM_URL = f"https://api.deepgram.com/v1/speak?model={self.MODEL_NAME}&encoding=linear16&sample_rate={self.SAMPLE_RATE}"
+
+        headers = {
+            "Authorization": f"Token {self.dg_api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {"text": text}
+
+        # Abrimos el stream de salida de la laptop
+        output_stream = self.p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self.SAMPLE_RATE,
+            output=True
+        )
+
+        start_time = time.time()
+        first_byte_received = False
+
+        try:
+            with requests.post(DEEPGRAM_URL, stream=True, headers=headers, json=payload) as r:
+                if r.status_code != 200:
+                    print(f"❌ Error API: {r.text}")
+                    return
+
+                # Leemos el stream por trozos
+                for chunk in r.iter_content(chunk_size=1024):
+                    if chunk:
+                        if not first_byte_received:
+                            ttfb = int((time.time() - start_time) * 1000)
+                            print(f"⚡ Latencia PyAudio (TTFB): {ttfb}ms")
+                            first_byte_received = True
+
+                        # Enviamos el chunk directamente a las bocinas
+                        output_stream.write(chunk)
+
+        except Exception as e:
+            print(f"💥 Error en reproducción: {e}")
+        finally:
+            # Esperamos a que termine de sonar y cerramos el stream del turno
+            output_stream.stop_stream()
+            output_stream.close()
+
+
+    def close(self):
+        """Llamar al cerrar la aplicación"""
+        self.p.terminate()

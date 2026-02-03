@@ -45,8 +45,12 @@ class GenerationModuleLlama:
         self.llm_model = llm_model
         self.memoria = None
         # print(f"Module Created!, gpu layers: {gpu_layers}.")
-    def initialize(self, initial_prompt, retrieval, debug=False, max_tokens=1024):
-        self.initial_prompt = initial_prompt
+
+    def initialize(self, initial_prompt=None, retrieval=None, debug=False, max_tokens=1024):
+        if initial_prompt is not None:
+            self.initial_prompt = initial_prompt
+        else:
+            self.initial_prompt = INIT_PROMPT_LLAMA
         self.retrieval = retrieval
         self.debug = debug
         self.follow_up_model = FollowUpDetector(retrieval=self.retrieval, threshold=0.5, debug=debug)
