@@ -20,6 +20,28 @@ How to run (local dev):
 3) Set env vars (see CONFIG section).
 4) uvicorn twilio_mvp_agent:app --host 0.0.0.0 --port 8000
 
+
+TODO
+log_tracking update.
+[ ] Latencia E2E: T_fin_habla_usuario hasta T_inicio_audio_agente.
+
+[ ] TTFB (Time to First Byte): Tiempo desde que el LLM genera el primer token hasta que el primer paquete de audio sale hacia Twilio.
+
+[ ] Captura de Tiempos (Timestamps):
+$T_0$: Fin de audio del usuario (inicio de safe_handle_turn).
+$T_1$: Fin de ASR (transcripción lista).
+$T_2$: Primer token del LLM (inicio de TTS).
+
+[ ] Latencia LLM vs TTS: Tiempo que el LLM tarda en entregar el texto completo vs tiempo de síntesis de Deepgram.
+
+[ ] Throughput (TPS): Total_tokens / Tiempo_generacion_LLM.
+
+[ ] Contador de Fallos de Entendimiento: Incrementar cada vez que el ASR devuelve vacío o el LLM dispara una respuesta tipo "No entendí".
+
+[ ] NER Accuracy & Hallucination Check: Loguear la entidad detectada (ej. Sede Querétaro) vs lo que el usuario realmente pidió (requiere validación posterior o un modelo evaluador).
+
+[ ] Calculador de Costos: Multiplicador dinámico basado en duración de la llamada y consumo de tokens.
+
 In production you must expose HTTPS + WSS publicly and point Twilio to:
 - Answer URL: https://YOUR_DOMAIN/twilio/answer
 - Media Stream WS: wss://YOUR_DOMAIN/twilio/ws
@@ -58,6 +80,7 @@ from RAG_CORE.generation_module import GenerationModuleLlama
 from RAG_CORE.retrieval_module import RetrievalModule
 from voices.TTS_engine import Speaker, speaker_wav_path  # uses XTTS + speaker_wav_path
 import campaign_data.utils_script as MESSAGES
+from utils.log_tracking import CallMetrics
 
 
 # -----------------------------
@@ -464,7 +487,7 @@ async def twilio_ws(ws: WebSocket):
         bot_task = None
         bot_speaking = False
 
-    async def send_mulaw_audio(mulaw_bytes: bytes):
+    async def send_mulaw_audio(mulaw_bytes: bytes, turn_data=None):
         nonlocal bot_speaking, bot_pending, bot_started_streaming, last_bot_end_ts
         bot_speaking = True
         try:
@@ -490,6 +513,8 @@ async def twilio_ws(ws: WebSocket):
 
                 payload_b64 = base64.b64encode(chunk).decode("ascii")
                 msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": payload_b64}}
+                if turn_data and turn_data.get("t3") is not None:
+                    turn_data["t3"] = time.perf_counter()
                 await ws_send(msg)
 
                 sent_frames += 1
@@ -509,7 +534,7 @@ async def twilio_ws(ws: WebSocket):
             last_bot_end_ts = time.perf_counter()
 
     # Funcion usada en vez de speak_text
-    async def stream_text_to_speech(sentence: str):
+    async def stream_text_to_speech(sentence: str, turn_data=None):
         """Sintetiza y envía una sola oración de forma atómica."""
         try:
             # XTTS Synthesis (Inferencia)
@@ -521,7 +546,9 @@ async def twilio_ws(ws: WebSocket):
             mulaw = audioop.lin2ulaw(pcm16, SAMPLE_WIDTH_BYTES)
 
             # Envío a Twilio
-            await send_mulaw_audio(mulaw)
+            if turn_data is not None:
+                turn_data["t3"] = time.perf_counter()
+            await send_mulaw_audio(mulaw, turn_data=turn_data)
         except asyncio.CancelledError:
             # Manejo de Barge-in: si el usuario interrumpe, se detiene la síntesis
             raise
@@ -545,7 +572,7 @@ async def twilio_ws(ws: WebSocket):
             print("[TTS] dur_in", dur_in, "dur_out", dur_out)
         await send_mulaw_audio(mulaw)
 
-    async def start_speaking(text: str, is_partial=False):
+    async def start_speaking(text: str, is_partial=False, turn_data=None):
         nonlocal bot_task, last_tts_task, bot_pending, bot_started_streaming
         bot_pending = True
         bot_started_streaming = False
@@ -564,7 +591,7 @@ async def twilio_ws(ws: WebSocket):
         # Capturamos la referencia actual de la cola ANTES de crear la nueva tarea
         prev_task = last_tts_task
 
-        async def speech_wrapper():
+        async def speech_wrapper(turn_data=None):
             nonlocal bot_pending
             try:
                 # Si hay una tarea previa en la cola, esperamos a que termine
@@ -572,7 +599,7 @@ async def twilio_ws(ws: WebSocket):
                     await prev_task
 
                 # Ejecutamos la síntesis y envío actual
-                await stream_text_to_speech(text)
+                await stream_text_to_speech(text, turn_data=turn_data)
             except asyncio.CancelledError:
                 # Si se cancela durante la espera o el proceso, propagamos
                 raise
@@ -582,7 +609,7 @@ async def twilio_ws(ws: WebSocket):
                     bot_pending = False
 
         # 3. Creación y asignación de la tarea
-        new_task = asyncio.create_task(speech_wrapper())
+        new_task = asyncio.create_task(speech_wrapper(turn_data=turn_data))
         bot_task = new_task  # Para el control global de cancelación
         last_tts_task = new_task  # Para el encadenamiento del stream
 
@@ -648,7 +675,7 @@ async def twilio_ws(ws: WebSocket):
                 await ws.close()
                 return
 
-    async def handle_user_turn_stream(pcm16_turn: bytes, call_sid: str):
+    async def handle_user_turn_stream(pcm16_turn: bytes, call_sid: str, turn_data: dict):
         """ASR -> agent reply -> next prompt / goodbye."""
         nonlocal turn_idx, bot_task
 
@@ -666,17 +693,32 @@ async def twilio_ws(ws: WebSocket):
 
         if not text:
             # Aquí is_partial=False porque es una respuesta de error única
-            await start_speaking("Perdón, no te entendí. ¿Puedes repetirlo?", is_partial=False)
+            turn_data["was_misunderstood"] = True
+            await start_speaking("Perdón, no te entendí. ¿Puedes repetirlo?", is_partial=False, turn_data=None)
             return
         if DEBUG:
             print(f"[ASR] User said: {text}")
 
+        # Decir un mensaje de retroalimentacion para el usuario.
+        await start_speaking("Gracias, dame un momento en lo que verifico lo que me pediste.", is_partial=False)
+
+        turn_data["t1"] = time.perf_counter() # Get the time taken to transcribe message
+        turn_data["user_text"] = text
         # --- PARTE 2: CONSUMO DEL LLM STREAM ---
         full_response_text = ""
         end_flag = False
         # Creamos un bloque try para manejar la interrupción total si fuera necesario
+
+        t2_captured = False # Flag to capture first llm sentence.
+
         async for response in llm_module.rag_answer_stream(text):
             sentence = response['text']
+
+            # CAPTURA DE T2: Solo ocurre en el primer paquete que contenga texto
+            if not t2_captured and sentence.strip():
+                t2_captured = True
+                turn_data["t2"] = time.perf_counter()
+
             if not sentence:
                 continue
 
@@ -694,17 +736,19 @@ async def twilio_ws(ws: WebSocket):
                 return
             else:
                 # Hablamos la oración. Usamos is_partial=True para que se encole/procese fluído.
-                await start_speaking(sentence, is_partial=True)
+                await start_speaking(sentence, is_partial=True, turn_data=turn_data)
                 full_response_text += " " + sentence
                 if DEBUG:
                     print("[ASR] sentence text:", sentence)
 
-        # --- PARTE 3: GESTIÓN DE ESTADOS Y CIERRE ---
+        turn_data["bot_text"] = full_response_text
+        turn_data["t_llm_end"] = time.perf_counter()
+        call_metrics.log_turn(turn_data)
+
         turn_idx += 1
         if DEBUG:
             print("[DEBUG] Turno en cuestion: ", turn_idx)
-
-        if "adiós" in full_response_text.lower() or turn_idx > 5 or end_flag:
+        if "adiós" in full_response_text.lower() or turn_idx > 10 or end_flag:
             # Esperamos a que termine de hablar antes de colgar
             if bot_task and not bot_task.done():
                 try:
@@ -712,6 +756,7 @@ async def twilio_ws(ws: WebSocket):
                 except asyncio.CancelledError:
                     pass
             await asyncio.sleep(1.5)
+            # --- PARTE 3: GESTIÓN DE ESTADOS Y CIERRE ---
             if DEBUG:
                 print("[WS] Cerrando conexión por fin de turno o despedida.")
             await ws.close()
@@ -722,16 +767,31 @@ async def twilio_ws(ws: WebSocket):
             return
 
         processing_turn = True
+        t0 = time.perf_counter()
+
+        turn_data = {
+            "t0": t0,
+            "t1" : 0,
+            "t2" : 0,
+            "t3" : 0,
+            "was_misunderstood": False,
+            "bot_text": "",
+            "user_text": "",
+            "t_llm_end": 0
+        }
+
         try:
             # Procesamos el turno (ASR -> RAG -> LLM -> TTS)
-            await handle_user_turn_stream(audio, sid)
+            await handle_user_turn_stream(audio, sid, turn_data)
         except Exception as e:
             print(f"[ERROR] Fallo en el flujo del turno: {e}")
+            turn_data["was_misunderstood"] = True
             # Opcional: Enviar un mensaje de error vocal al usuario
             await start_speaking("Lo siento, tuve un problema técnico. ¿Podrías repetir eso?", is_partial=False)
         finally:
             processing_turn = False
 
+    call_metrics = CallMetrics()
     try:
         # Start: greeting + question 1
         while True:
@@ -758,6 +818,8 @@ async def twilio_ws(ws: WebSocket):
                 stream_sid = msg["start"]["streamSid"]
                 call_sid = msg["start"]["callSid"]
                 # Start scripted greeting + Q1
+                call_metrics.initialize(call_sid)
+                bot_speaking = True
                 if DEBUG:
                     print("TWILIO WS START:", msg["start"])
                     print("[WS] Stream SID:", stream_sid)
@@ -766,7 +828,7 @@ async def twilio_ws(ws: WebSocket):
                 continue
 
             if event == "media":
-                if not stream_sid or processing_turn:
+                if not stream_sid or processing_turn or bot_speaking or (time.perf_counter() - call_metrics.start_time < 2.0):
                     # ignore until start arrives
                     continue
 

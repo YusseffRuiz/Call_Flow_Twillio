@@ -4,9 +4,8 @@ import tiktoken
 # import torch
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
-# from langchain_community.llms import CTransformers
 
-import os, time
+import time
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -84,7 +83,7 @@ class GenerationModuleLlama:
         # Uso de nuestra función ask previamente desarrollada. - Retrieval
         query = query.lower()
 
-        # 7. Detección simple de fin de sesión
+        # Detección simple de fin de sesión
         if self.follow_up_model.detect_exit_intent(query):
             self.memoria.clear()
             return "Ha sido un gusto ayudarte. ¡Que tengas buen día! ¡Adiós!", True
