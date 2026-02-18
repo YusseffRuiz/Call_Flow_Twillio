@@ -21,10 +21,6 @@ How to run (local dev):
 4) uvicorn twilio_mvp_agent:app --host 0.0.0.0 --port 8000
 
 
-TODO
-
-Hacer version de paga vs version gratuita
-
 In production you must expose HTTPS + WSS publicly and point Twilio to:
 - Answer URL: https://YOUR_DOMAIN/twilio/answer
 - Media Stream WS: wss://YOUR_DOMAIN/twilio/ws

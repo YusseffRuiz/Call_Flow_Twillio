@@ -3,14 +3,14 @@
 ## Overview
 Este proyecto implementa un agente de voz en tiempo real usando telefonía via Twilio Streams y WebSockets.
 El flujo de la arquitectura para contestar preguntas durante la llamada contiene: 
-XTTS (clonación de voz), ASR (automatic speech recognition) y LLM+RAG.
+XTTS (clonación de voz) o Deepgram, ASR (automatic speech recognition) y LLM+RAG.
 
 Es un proyecto privado en México.
 
 La versión actual es un MVP con las siguientes características:
 
 - Audio Bidireccional (Twilio + Servidor)
-- TTS playback
+- TTS playback (usando TTS o Deepgram)
 - Detección de turnos y silencios (utilizando VAD)
 - Barge-in (Interrupciones del cliente)
 - End-to-end: ASR → RAG → LLM → TTS loop 
@@ -36,7 +36,7 @@ En este punto, se preparó para que se utilice ngrok como punto de exposición p
            │           │
            ▼           ▼
     ┌─────────────┐   ┌─────────────────────┐
-    │     ASR     │   │        XTTS         │
+    │     ASR     │   │  XTTS/ DeepGram     │
     │ faster-     │   │  Voice Cloning TTS  │
     │ whisper     │   │  (Coqui XTTS)       │
     └──────┬──────┘   └─────────┬───────────┘
@@ -76,6 +76,24 @@ En este punto, se preparó para que se utilice ngrok como punto de exposición p
      - Uso de Llama.cpp como backend.
      - Si no se utiliza CUDA, el sistema es demasiado lento.
 
+
+**El sistema soporta un switch de configuración entre ejecución Local (Edge) y Cloud (Performance):**
+1. Nivel Base (Local/Gratis)
+   - LLM: Llama-cpp (GGUF) corriendo en CUDA local.
+   - Ventaja: Privacidad total de datos y costo cero de inferencia.
+   - Limitación: Requiere hardware GPU de alto nivel para mantener latencia < 2s.
+2. Nivel Pro (Cloud/Pago)
+   - LLM: Mistral AI Cloud (vía API asíncrona).
+   - XTTS: Inferencia optimizada con Caché de Audios de Sistema (Fillers).
+   - Ventaja: Escalabilidad, mayor inteligencia semántica y respuestas casi instantáneas.
+
+**Switch de Modelo**
+
+Mediante variables de entorno se controla el uso Pro o el Base:
+
+`VERSION_PAGA = True`
+
+
 ## Uso del sistema
 1. Instalar dependencias:
 
@@ -111,12 +129,14 @@ Invoke-RestMethod -Method Post -Uri "https://ngrok-dev-web.com/twilio/start_call
 - ✅ ASR Funcional.
 - ✅ Barge-in funcional.
 - ✅ Integración RAG + LLM. 
+- ✅ Ruteo a un asesor o teléfono real. 
+- ✅ Safeguards básicos (cambio de tema o no se escuchó). 
+- ✅ Analítica de llamadas. 
 - ⚠️ Tunear sensibilidad al ruido.
 - ⚠️ Sin intento de llamada/ Sin recuperación si hay fallas.
 
 ## Siguientes pasos
 - Tresholds adaptativos para VAD (Detección de ruido).
 - Reintento de llamadas y flujo de fallo.
-- Analítica de llamada y métricas.
 - Deployment sin ngrok (HTTPS/WSS)
-- Mejorar velocidad de respuesta.
+- Deployment en servidor
