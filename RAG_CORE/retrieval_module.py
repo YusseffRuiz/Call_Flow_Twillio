@@ -587,15 +587,15 @@ class RetrievalModule:
             return line
 
         def ret_docs(docs_flag, reply, docs, max_show=None):
+            # devolver lista de Document (ya filtrados y ordenados)
             if docs_flag:
-                # devolver lista de Document (ya filtrados y ordenados)
                 if docs is not None:
-                    if max_show is not None: return reply, [d for (d, _) in docs[:max_show]]
-                    return reply, [d for (d, _) in docs]
-                else:
-                    return reply, [None, None]
-            else:
-                return reply
+                    if max_show is not None:
+                        limit = max_show if max_show is not None else len(docs)
+                        # Retornamos el Document con el score ya inyectado en metadata
+                        return reply, [d for (d, s) in docs[:limit]]
+                return reply, [None, None]
+            return reply
 
         def ok(meta):
             return all(str(meta.get(k, "")).lower() == str(v).lower()
@@ -605,18 +605,23 @@ class RetrievalModule:
 
         if memoria:
             last_docs = memoria.get_last_docs()
-            # print(last_docs)
             if last_docs:
-                rescored = _rescore_docs_with_query(self.embeddings, normalize_query_e5(query), last_docs)
+                # Re-scoreamos solo sobre lo que ya tenemos en memoria (para no tener latencia de búsqueda vectorial)
+                docs_to_rescore = last_docs[:10]
+                rescored = _rescore_docs_with_query(self.embeddings, normalize_query_e5(query), docs_to_rescore)
                 rescored_sorted = sorted(rescored, key=lambda x: x[1], reverse=True)
 
-                # Aplica reglas y formato
-                docs = rescored_sorted[:max_to_show]
-                formatted = [get_line_output(d.metadata) for d, _ in docs]
+                docs_subset = rescored_sorted[:max_to_show]
+                formatted = [get_line_output(d.metadata) for d, _ in docs_subset]
                 answer = "\n".join(formatted)
 
-                resp = {"question": query, "answer": answer, "hits": [{"metadata": d.metadata} for d, _ in docs]}
-                return (resp, [d for d, _ in docs]) if return_docs else resp
+                # Inyectamos score en hits para telemetría
+                resp = {
+                    "question": query,
+                    "answer": answer,
+                    "hits": [{"metadata": d.metadata, "score": float(s)} for d, s in docs_subset]
+                }
+                return (resp, [d for d, _ in docs_subset]) if return_docs else resp
 
         # 1) Normalizar query para e5
         q = normalize_query_e5(query)
@@ -637,8 +642,18 @@ class RetrievalModule:
         if self.fast_path:
             fast_docs, ume_flag = self.fast_filter_by_metadata(query, filtros, N_min=3, N_max=max_to_show * 2)
             if fast_docs:
+                # Si fast_path devuelve lista, inyectamos scores dummies
+                if isinstance(fast_docs, Document):
+                    fast_docs_temp = [(fast_docs, 1.0)]
+                else:
+                    fast_docs_temp = [(d, 1.0) for d in fast_docs]
+
+                    for d, s in fast_docs_temp:
+                        d.metadata['score'] = s
+                        setattr(d, 'score', s)
                 if ume_flag:
-                    lines = [get_line_output(fast_docs.metadata)]
+                    doc_obj = fast_docs if isinstance(fast_docs, Document) else fast_docs[0]
+                    lines = [get_line_output(doc_obj.metadata)]
                     header = f"Cualquier tipo de terapias alternativas se pueden ver en UME."
                     answer = header + "\n" + "\n".join(lines)
 
@@ -646,23 +661,25 @@ class RetrievalModule:
                             "answer": answer,
                             "hits": [{"metadata": fast_docs.metadata}]}
                     return (resp, fast_docs) if return_docs else resp
-                # Desde aquí puedes saltarte el vector percentile/threshold y formatear de una vez:
+
                 enhanced = []
-                for d in fast_docs[:max_to_show]:
-                    m = {"metadata": d.metadata.copy()}
-                    m["metadata"] = apply_business_rules(m)
-                    # enhanced.append((m["metadata"], m["score"]))
-                    enhanced.append(m["metadata"])
+                for d, s in fast_docs_temp[:max_to_show]:
+                    # apply_business_rules espera un dict con 'metadata' y 'score'
+                    m_wrapper = {"metadata": d.metadata.copy(), "score": s}
+                    d.metadata = apply_business_rules(m_wrapper)
+                    enhanced.append(d.metadata)
 
                 lines = [get_line_output(m) for m in enhanced]
 
                 header = "Opciones encontradas (vía búsqueda rápida por metadatos):"
                 answer = header + "\n" + "\n".join(lines)
-                resp = {"question": query,
-                        "answer": answer,
-                        "hits": [{"metadata": d} for d, _ in fast_docs[:max_to_show]]}
-                        # "hits": [{"metadata": d} for d in fast_docs[:max_to_show]]}
-                return ret_docs(docs_flag=return_docs, reply=resp, docs=fast_docs, max_show=max_to_show)
+                resp = {
+                    "question": query,
+                    "answer": answer,
+                    "hits": [{"metadata": m, "score": 1.0} for m in enhanced]
+                }
+
+                return ret_docs(docs_flag=return_docs, reply=resp, docs=fast_docs_temp, max_show=max_to_show)
 
         # 2) Recuperar más (3 veces top_k) de lo necesario para filtrar
         vec_results = []
@@ -671,21 +688,28 @@ class RetrievalModule:
         # --- Vectorial (FAISS + embeddings) ---
         if retrieval_mode in ("similarity", "mmr", "hybrid"):
             if retrieval_mode == "similarity" or retrieval_mode == "hybrid":
-                vec_results = self.vectorstore.similarity_search_with_score(
-                    q, k=max(40, top_k * 3))
+                raw_vect = self.vectorstore.similarity_search_with_score(q, k=max(40, top_k * 3))
+                for doc, score in raw_vect:
+                    doc.metadata['score'] = float(score)
+                    vec_results.append((doc, float(score)))
             else:  # "mmr" o "hybrid"
-                mmr_docs = self.vectorstore.max_marginal_relevance_search(
-                    q, k=top_k, fetch_k=max(40, top_k * 3), lambda_mult=0.7,)
+                mmr_docs = self.vectorstore.max_marginal_relevance_search(q, k=top_k, fetch_k=max(40, top_k * 3), lambda_mult=0.7,)
                 if not mmr_docs and retrieval_mode != "hybrid":
                     resp = {"question": query, "answer": "No encontré resultados.", "hits": []}
                     return ret_docs(docs_flag=return_docs, reply=resp, docs=mmr_docs, max_show=max_to_show)
 
                 if mmr_docs:
-                    vec_results = _rescore_docs_with_query(self.embeddings, q, mmr_docs)
+                    rescored_mmr = _rescore_docs_with_query(self.embeddings, q, mmr_docs)
+                    for doc, score in rescored_mmr:
+                        doc.metadata['score'] = float(score)
+                        vec_results.append((doc, float(score)))
 
         # --- BM25 puro ---
         if retrieval_mode in ("bm25", "hybrid"):
-            bm25_results = self._bm25_search(query, k=max(40, top_k * 3))
+            raw_bm25 = self._bm25_search(query, k=max(40, top_k * 3))
+            for doc, score in raw_bm25:
+                doc.metadata['score'] = float(score)
+                bm25_results.append((doc, float(score)))
 
         # --- Seleccionar / fusionar resultados según modo ---
         if retrieval_mode == "similarity" or retrieval_mode == "mmr":
@@ -700,6 +724,9 @@ class RetrievalModule:
                 k_out=max(40, top_k * 3),
                 alpha=hybrid_alpha,
             ) if vec_results and bm25_results else vec_results or bm25_results
+
+            for doc, score in results:
+                doc.metadata['score'] = float(score)
         else:
             results = []
 
@@ -834,7 +861,7 @@ class RetrievalModule:
         #     else:
         #         degradation_note = " (relajé filtros para no dejarte sin opciones)."
 
-        lines = [get_line_output(m) for m, _ in enhanced[:max_to_show]]
+        lines = [get_line_output(m) for m, s in enhanced[:max_to_show]]
         # Output del sistema.
 
         #header = f"Opciones encontradas (umbral={threshold:.2f}, percentil={percentile * 100:.0f}%){degradation_note}:"

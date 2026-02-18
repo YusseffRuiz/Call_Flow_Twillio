@@ -1,3 +1,4 @@
+import asyncio
 import re
 
 import tiktoken
@@ -6,6 +7,8 @@ from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 
 import time
+
+from mistralai import Mistral
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -52,7 +55,7 @@ class GenerationModuleLlama:
             self.initial_prompt = INIT_PROMPT_LLAMA
         self.retrieval = retrieval
         self.debug = debug
-        self.follow_up_model = FollowUpDetector(retrieval=self.retrieval, threshold=0.5, debug=debug)
+        self.follow_up_model = IntentionDetector(retrieval=self.retrieval, threshold=0.5, debug=debug)
         self.memoria = ConversationalMemory(max_tokens=max_tokens)
 
 
@@ -205,20 +208,13 @@ class GenerationModuleLlama:
         """
         Regresa la respuesta del sistema LLM y un bool indicando si ya termino la interaccion (True) o si continua (False).
         """
-        # Uso de nuestra función ask previamente desarrollada. - Retrieval
         query = query.lower()
-
-        # 7. Detección simple de fin de sesión
-        if self.follow_up_model.detect_exit_intent(query):
-            self.memoria.clear()
-            yield {"text": "Ha sido un gusto ayudarte. ¡Que tengas buen día! ¡Adiós!", "end_session": True}
-            return
 
         docs = self.memoria.get_last_docs()  # revisamos si hay informacion previa
         used_cached_docs = docs is not None and len(docs) > 0
 
         follow_up = self.follow_up_model.is_follow_up(query, self.memoria.get_recent_turns())
-        # Verificación adicional: ¿el usuario cambió de intención a pesar de ser follow-up?
+        # Verificación adicional: ¿el usuario cambió de intención a pesar de que parece ser follow-up?
         if follow_up and not self.follow_up_model.is_follow_up_user(query, self.memoria.get_recent_turns()):
             if self.debug:
                 print("[DEBUG] Cambio de intención detectado. Se reinicia contexto y búsqueda.")
@@ -226,20 +222,38 @@ class GenerationModuleLlama:
             docs = []  # Limpiamos docs previos para no arrastrar contexto viejo
         if self.debug:
             print("Follow up: ", follow_up)
-
+        loop = asyncio.get_event_loop()
         if not follow_up:
             # Validamos si el usuario sigue en la misma intención, aunque no sea un follow-up directo
             if self.should_continue_context(query, used_cached_docs):
                 follow_up = True
+                resp, docs = await loop.run_in_executor(None, lambda: self.retrieval.ask(query, return_docs=True, memoria=self.memoria))
+                # resp, docs = self.retrieval.ask(query, return_docs=True, memoria=self.memoria)
                 if self.debug:
                     print(
                         "[DEBUG] No se detectó follow-up directo, pero sí continuidad semántica. Se mantiene contexto.")
             else:
-                resp, docs = self.retrieval.ask(query, return_docs=True, memoria=None)
+                resp, docs = await loop.run_in_executor(None, lambda: self.retrieval.ask(query, return_docs=True,
+                                                                                         memoria=self.memoria))
+                is_relevant = any(doc.metadata.get('score', 1.0) <= 0.50 for doc in docs) if docs else False  # 0.0 es max relevant
 
-                if not docs:
+                has_lexicon_match = self.follow_up_model.is_service_in_scope(query)
+
+                if has_lexicon_match or not is_relevant:
+                    if self.debug:
+                        print(f"[DEBUG] No hizo match con los temas especificados: {has_lexicon_match} o"
+                              f" no fue relevante: {is_relevant}")
+                    yield {"text": "out_of_scope", "end_session": False}
+                    return
+
+                if not docs or not is_relevant:
                     self.memoria.add_turn("user", query)
                     self.memoria.add_turn("assistant", "No encontré información suficiente en la base.")
+                    if self.debug:
+                        tmp_docs = True if docs else False
+                        score_tmp = 1.0 if not docs else max(doc.metadata.get('score', 1.0) for doc in docs)
+                        print(f"[DEBUG] No se encontró información suficiente debido a la falta de docs ({tmp_docs})"
+                              f"o a is_relevant ({is_relevant}) con score: {score_tmp}")
                     yield {"text": "No encontré información suficiente en la base.", "end_session": False}
                     return
 
@@ -255,8 +269,11 @@ class GenerationModuleLlama:
                     print("[DEBUG] Follow-up detectado, pero no hay documentos previos.")
                 self.memoria.add_turn("user", query)
                 self.memoria.add_turn("assistant", "No tengo contexto previo suficiente.")
-                yield {"text": "Podrías especificar a qué unidad o tema te refieres?", "end_session": False}
-                return
+                # yield {"text": "Podrías especificar a qué unidad o tema te refieres?", "end_session": False}
+                follow_up = False
+                # loop = asyncio.get_event_loop()
+                resp, docs = await loop.run_in_executor(None, lambda: self.retrieval.ask(query, return_docs=True, memoria=None))
+                # resp, docs = self.retrieval.ask(query, return_docs=True, memoria=None)
 
             matches = self.follow_up_model.match_sucursal_from_input(user_input=query, docs=docs)
             if matches:
@@ -328,7 +345,7 @@ class GenerationModuleLlama:
             if " " in token:
                 word_count += 1
             # Detectamos fin de oración para disparar el TTS
-            if any(punct in token for punct in [".", "!", "?", "\n"]):
+            if any(punct in token for punct in ["!", "?", "\n"]):
                 clean_sentence = sentence_buffer.strip()
                 if clean_sentence:
                     if self.debug:
@@ -365,6 +382,196 @@ class GenerationModuleLlama:
         except Exception as e:
             print(f"[DEBUG] Error al validar continuidad de contexto: {e}")
             return False
+
+
+class GenerationModuleMistral(GenerationModuleLlama):
+    def __init__(self, llm_model=None, api_key=None):
+        super().__init__(llm_model)
+        self.model_name = "mistral-small-latest"
+        self.api_key = api_key
+
+    def initialize(self, initial_prompt=None, retrieval=None, debug=False, max_tokens=1024):
+        super().initialize(initial_prompt, retrieval, debug, max_tokens)
+        self.llm_model = Mistral(api_key=self.api_key)
+
+    async def rag_answer_stream(self, query: str):
+        """
+        Regresa la respuesta del sistema LLM y un bool indicando si ya termino la interaccion (True) o si continua (False).
+        """
+        query = query.lower()
+
+        docs = self.memoria.get_last_docs()  # revisamos si hay informacion previa
+        used_cached_docs = docs is not None and len(docs) > 0
+
+        follow_up = self.follow_up_model.is_follow_up(query, self.memoria.get_recent_turns())
+        # Verificación adicional: ¿el usuario cambió de intención a pesar de que parece ser follow-up?
+        if follow_up and not self.follow_up_model.is_follow_up_user(query, self.memoria.get_recent_turns()):
+            if self.debug:
+                print("[DEBUG] Cambio de intención detectado. Se reinicia contexto y búsqueda.")
+            follow_up = False  # Forzamos modo nueva búsqueda
+            docs = []  # Limpiamos docs previos para no arrastrar contexto viejo
+        if self.debug:
+            print("Follow up: ", follow_up)
+        loop = asyncio.get_event_loop()
+        if not follow_up:
+            # Validamos si el usuario sigue en la misma intención, aunque no sea un follow-up directo
+            if self.should_continue_context(query, used_cached_docs):
+                follow_up = True
+                resp, docs = await loop.run_in_executor(None, lambda: self.retrieval.ask(query, return_docs=True, memoria=self.memoria))
+                # resp, docs = self.retrieval.ask(query, return_docs=True, memoria=self.memoria)
+                if self.debug:
+                    print(
+                        "[DEBUG] No se detectó follow-up directo, pero sí continuidad semántica. Se mantiene contexto.")
+            else:
+                # loop = asyncio.get_event_loop()
+                resp, docs = await loop.run_in_executor(None, lambda: self.retrieval.ask(query, return_docs=True,
+                                                                                         memoria=self.memoria))
+
+                is_relevant = any(doc.metadata.get('score', 1.0) <= 0.50 for doc in docs) if docs else False # 0.0 es max relevant
+                has_lexicon_match = self.follow_up_model.is_service_in_scope(query)
+
+                if has_lexicon_match or not is_relevant:
+                    if self.debug:
+                        print(f"[DEBUG] No hizo match con los temas especificados: {has_lexicon_match} o"
+                              f" no fue relevante: {is_relevant}")
+                    yield {"text": "out_of_scope", "end_session": False}
+                    return
+
+                if not docs or not is_relevant:
+                    self.memoria.add_turn("user", query)
+                    self.memoria.add_turn("assistant", "No encontré información suficiente en la base.")
+                    if self.debug:
+                        tmp_docs = True if docs else False
+                        score_tmp = 1.0 if not docs else max(doc.metadata.get('score', 1.0) for doc in docs)
+                        print(f"[DEBUG] No se encontró información suficiente debido a la falta de docs ({tmp_docs})"
+                              f"o a is_relevant ({is_relevant}) con score: {score_tmp}")
+                    yield {"text": "No encontré información suficiente en la base.", "end_session": False}
+                    return
+
+                self.memoria.set_last_docs(docs)
+                if self.debug:
+                    print("[DEBUG] Nueva búsqueda realizada, se guardan nuevos documentos.")
+                self.initial_prompt = INIT_PROMPT_LLAMA
+
+        else:
+            # 4. En caso de follow-up, usar los documentos previos
+            if not used_cached_docs:
+                if self.debug:
+                    print("[DEBUG] Follow-up detectado, pero no hay documentos previos.")
+                self.memoria.add_turn("user", query)
+                self.memoria.add_turn("assistant", "No tengo contexto previo suficiente.")
+                # yield {"text": "Podrías especificar a qué unidad o tema te refieres?", "end_session": False}
+                follow_up = False
+                # loop = asyncio.get_event_loop()
+                resp, docs = await loop.run_in_executor(None, lambda: self.retrieval.ask(query, return_docs=True, memoria=None))
+                # resp, docs = self.retrieval.ask(query, return_docs=True, memoria=None)
+
+            matches = self.follow_up_model.match_sucursal_from_input(user_input=query, docs=docs)
+            if matches:
+                docs = [doc for doc, _ in matches]
+                self.memoria.set_last_docs(docs)
+                self.initial_prompt = DETAILS_PROMPT
+                if self.debug:
+                    print(f"[DEBUG] Se detectaron {len(matches)} coincidencias por follow-up:")
+                    for doc in docs:
+                        nombre = doc.metadata.get("nombre_oficial", "Sin nombre")
+                        municipio = doc.metadata.get("municipio", "Sin municipio")
+                        estado = doc.metadata.get("estado", "Sin estado")
+                        print(f" - {nombre} ({municipio}, {estado})")
+            else:
+                # Solo considerar cambio de intención si NO hubo match
+                is_same_topic = self.follow_up_model.is_follow_up_user(query, self.memoria.get_recent_turns())
+                if self.debug:
+                    print(f"[DEBUG] Similitud semántica entre queries: {is_same_topic}")
+                if not is_same_topic:
+                    if self.debug:
+                        print("[DEBUG] Cambio de intención detectado. Se reinicia contexto y búsqueda.")
+                    follow_up = False
+                    docs = []
+                    self.memoria.set_last_docs([])
+                else:
+                    self.initial_prompt = CONTINUOUS_PROMPT_LLAMA
+                    if self.debug:
+                        print(
+                            "[DEBUG] Follow-up válido sin coincidencia específica. Se mantiene el contexto actual.")
+
+        context = build_context_from_docs(docs, full=follow_up)
+
+        historial = "\n".join([f"{t['role'].title()}: {t['content']}" for t in self.memoria.get_recent_turns()])
+        context_tokens = count_tokens(context)
+        historial_tokens = count_tokens(historial)
+        self.memoria.trim_if_exceeds_tokens(context_tokens, historial_tokens)
+
+        # Armado de prompt
+        messages = self.build_mistral_prompt(context=context, question=query, historial=self.memoria.get_recent_turns())
+
+        if self.debug:
+            print("Finished Context, tokens number: ", context_tokens + historial_tokens)
+
+        # Generation
+        t0 = time.perf_counter()
+        # Mistral soporta async stream nativamente
+        stream_response = await self.llm_model.chat.stream_async(
+            model=self.model_name,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=512
+        )
+        t1 = time.perf_counter()
+
+        ## Debugging
+        if self.debug:
+            print("Finished invoke, time: ", t1 - t0, " s")
+            # print("Prompt completo:\n", prompt_value)
+            # print("Respuesta tokens:", len(out["choices"][0]["text"].split()))
+            # print("Respuesta completa:\n", out["choices"][0]["text"])
+
+        sentence_buffer = ""
+        full_response_text = ""
+
+        async for chunk in stream_response:
+            token = chunk.data.choices[0].delta.content
+            if token is None: continue
+
+            sentence_buffer += token
+
+            # Detectamos fin de oración para disparar el TTS
+            if any(punct in token for punct in ["!", "?", "\n"]):
+                clean_sentence = sentence_buffer.strip()
+                if clean_sentence:
+                    if self.debug:
+                        print(clean_sentence)
+                    # Quita asteriscos de negrita que el TTS lee como "asterisco"
+                    clean_sentence = clean_sentence.replace("*", "")
+                    full_response_text += " " + clean_sentence
+                    yield {"text": clean_sentence, "end_session": False}
+                    sentence_buffer = ""
+                    word_count = 0
+
+        # Entregar el resto si quedó algo en el buffer
+        if sentence_buffer.strip():
+            full_response_text += " " + sentence_buffer.strip()
+            yield {"text": sentence_buffer.strip(), "end_session": False}
+
+        # Actualizar memoria
+        self.memoria.add_turn("user", query)
+        self.memoria.add_turn("assistant", full_response_text.strip())
+
+    def build_mistral_prompt(self, context: str, question: str, historial: list = None):
+        # Plantilla oficial Mistral
+        messages = []
+
+        system_content = self.initial_prompt + "CONTEXTO: " + context
+        messages.append({"role": "system", "content": system_content})
+        if historial:
+            for turn in historial:
+                # turn['role'] debe ser 'user' o 'assistant'
+                messages.append({"role": turn["role"], "content": turn["content"]})
+
+        # Pregunta actual
+        messages.append({"role": "user", "content": question})
+
+        return messages
 
 
 INIT_PROMPT_LLAMA = """
@@ -485,6 +692,10 @@ class ConversationalMemory:
         self.turns = []
         self.last_docs = []
 
+    def get_last_assistant_response(self):
+        return self.last_assistant_query
+
+
     def trim_if_exceeds_tokens(self, tokens_so_far: int, tokens_next_context: int):
         """
         Recorta últimos turnos si la suma actual + contexto futuro excede el 90% del límite de tokens.
@@ -502,7 +713,7 @@ class ConversationalMemory:
             self.turns = self.turns[2:]
 
 
-class FollowUpDetector:
+class IntentionDetector:
     def __init__(self, retrieval=None, threshold=0.65, debug=True):
         if retrieval is None:
             self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -510,6 +721,36 @@ class FollowUpDetector:
             self.model = retrieval
         self.threshold = threshold
         self.debug = debug
+        self.intent_examples = {
+            "repeat": ["repite eso", "que dijiste", "no entendi", "puedes repetir", "me repites", "me puedes repetir", "no escuche", "no te escuche"],
+            "presence": ["sigues ahi", "hola", "me escuchas", "estas ahi"],
+            "wait": ["espera", "dame un segundo", "un momento", "aguanta", "dame un minuto", "un minuto"],
+            "audio_complaint": ["te escuchas mal", "está trabado", "audio robótico", "se escucha mal", "no entendi", "no te entiendo"],
+            "asesor": ["humano", "asesor", "quiero hablar con un asesor"]
+        }
+        self.domain_queries = [
+            "localizar sucursales sedes unidades", # Logística
+            "servicios médicos salud clinica hospital laboratorio dentista optometrista lentes enfermo",         # Salud
+            "horarios de atención dirección ubicación mapa dónde están",    # Información
+            "quiero saber información de la empresa sucursales disponibles" # Intención
+        ]
+
+        self.precomputed_embeddings = {}
+        for intent, phrases in self.intent_examples.items():
+            # Generamos una lista de vectores para cada intención
+            self.precomputed_embeddings[intent] = [
+                self.model.embeddings.embed_query(phrase) for phrase in phrases
+            ]
+
+        self.exit_examples = [
+            "ya terminé", "eso es todo", "puedes cortar la llamada", "terminamos", "no tengo mas preguntas", "adiós",
+            "es todo", "seria todo", "no necesito nada", "nada", "adios",
+        ]
+        self.emb_refs = [self.model.embeddings.embed_query(e) for e in self.exit_examples]
+
+        from RAG_CORE.rag_utils.mappings import SERVICE_LEXICON
+        self.compiled_items = self._compile_lexicon(SERVICE_LEXICON)
+
 
     def is_follow_up(self, user_input: str, memory_turns: list) -> bool:
         # Follow up semantica
@@ -624,18 +865,49 @@ class FollowUpDetector:
 
     def detect_exit_intent(self, user_input: str) -> bool:
         # heurístico rápido
-        exit_patterns = [r"\b(terminar|adiós|eso es todo|cortar|no tengo más preguntas|terminar|es todo|seria todo)\b"]
+        TRESHOLD = 0.45
+        exit_patterns = [r"\b(terminar|eso es todo|cortar|no tengo más preguntas|terminar|es todo|seria todo)\b"]
         if any(re.search(p, user_input.lower()) for p in exit_patterns):
             return True
 
         # comparación semántica
-        ejemplos_salida = [
-            "ya terminé", "eso es todo", "puedes cortar la llamada", "terminamos", "no tengo mas preguntas", "adiós",
-            "es todo", "seria todo", "no necesito nada", "nada",
-        ]
         emb_user = self.model.embeddings.embed_query(user_input)
-        emb_refs = [self.model.embeddings.embed_query(e) for e in ejemplos_salida]
-        scores = [cosine_similarity([emb_user], [e])[0][0] for e in emb_refs]
+        scores = [cosine_similarity([emb_user], [e])[0][0] for e in self.emb_refs]
         if self.debug:
-            print("[DEBUG] Nivel de deteccion de finalizacion: ", scores, " Fin: ", max(scores) >= 0.58)
-        return max(scores) >= 0.58  # umbral ajustable
+            print("[DEBUG] Nivel de deteccion de finalizacion: ", scores, " Fin: ", max(scores) >= TRESHOLD)
+        return max(scores) >= TRESHOLD  # umbral ajustable
+
+    def get_semantic_intent(self, query: str, threshold: float = 0.45) -> str:
+        # 1. Solo generamos UN embedding (el de la pregunta actual)
+        query_emb = self.model.embeddings.embed_query(query)
+
+        best_intent = "rag_required"
+        max_score = 0
+
+        scores = []
+        # 2. Comparamos contra lo que ya tenemos en memoria RAM
+        for intent, example_embs in self.precomputed_embeddings.items():
+            scores = [cosine_similarity([query_emb], [ex_emb])[0][0] for ex_emb in example_embs]
+            current_max = max(scores)
+
+            if current_max > max_score and current_max >= threshold:
+                max_score = current_max
+                best_intent = intent
+        if self.debug:
+            print("[DEBUG] Nivel de deteccion de intent: ", scores, " Intent: ", best_intent, ", ", max(scores) >=threshold)
+
+        return best_intent
+    @staticmethod
+    def _compile_lexicon(lexicon):
+        """Compila todos los patrones RE del lexicón en una sola lista."""
+        patterns = []
+        for service, data in lexicon.items():
+            for regex_str in data.get("re", []):
+                patterns.append(re.compile(regex_str, re.IGNORECASE))
+        return patterns
+
+    def is_service_in_scope(self, text: str) -> bool:
+        """
+        Capa 1: Verifica mediante Regex si hay un servicio médico explícito.
+        """
+        return any(pattern.search(text) for pattern in self.compiled_items)

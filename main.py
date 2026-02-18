@@ -22,25 +22,8 @@ How to run (local dev):
 
 
 TODO
-log_tracking update.
-[ ] Latencia E2E: T_fin_habla_usuario hasta T_inicio_audio_agente.
 
-[ ] TTFB (Time to First Byte): Tiempo desde que el LLM genera el primer token hasta que el primer paquete de audio sale hacia Twilio.
-
-[ ] Captura de Tiempos (Timestamps):
-$T_0$: Fin de audio del usuario (inicio de safe_handle_turn).
-$T_1$: Fin de ASR (transcripción lista).
-$T_2$: Primer token del LLM (inicio de TTS).
-
-[ ] Latencia LLM vs TTS: Tiempo que el LLM tarda en entregar el texto completo vs tiempo de síntesis de Deepgram.
-
-[ ] Throughput (TPS): Total_tokens / Tiempo_generacion_LLM.
-
-[ ] Contador de Fallos de Entendimiento: Incrementar cada vez que el ASR devuelve vacío o el LLM dispara una respuesta tipo "No entendí".
-
-[ ] NER Accuracy & Hallucination Check: Loguear la entidad detectada (ej. Sede Querétaro) vs lo que el usuario realmente pidió (requiere validación posterior o un modelo evaluador).
-
-[ ] Calculador de Costos: Multiplicador dinámico basado en duración de la llamada y consumo de tokens.
+Hacer version de paga vs version gratuita
 
 In production you must expose HTTPS + WSS publicly and point Twilio to:
 - Answer URL: https://YOUR_DOMAIN/twilio/answer
@@ -71,12 +54,13 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import Response, JSONResponse
 from llama_cpp import Llama
+from starlette.websockets import WebSocketDisconnect
 from twilio.rest import Client
 
 
 # Your existing modules (from your repo)
 from AudioTranscription.ASREngine import AsrEngine
-from RAG_CORE.generation_module import GenerationModuleLlama
+from RAG_CORE.generation_module import GenerationModuleLlama, IntentionDetector, GenerationModuleMistral
 from RAG_CORE.retrieval_module import RetrievalModule
 from voices.TTS_engine import Speaker, speaker_wav_path  # uses XTTS + speaker_wav_path
 import campaign_data.utils_script as MESSAGES
@@ -86,6 +70,9 @@ from utils.log_tracking import CallMetrics
 # -----------------------------
 # CONFIG (env vars)
 # -----------------------------
+
+VERSION_PAGA = True  # cambiar variable True o False para gratuito.
+
 # Public base URL of this server, e.g. "https://voice.yourdomain.com"
 load_dotenv("Documents/keys.env")
 
@@ -119,6 +106,11 @@ FRAME_BYTES_PCM16 = FRAME_SAMPLES_8K * SAMPLE_WIDTH_BYTES  # 320 bytes PCM16
 LLM_MODEL_FILE = "../HF_Agents/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 HF_TOKEN = os.getenv("HF_TOKEN")
 DG_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+api_key_mistral = os.getenv("MISTRAL_API_KEY")
+
+if not api_key_mistral:
+    raise Exception("MISTRAL_KEY not set")
+
 if not DG_API_KEY:
     raise Exception("DEEPGRAM_API_KEY not found")
 
@@ -134,6 +126,7 @@ config = {'max_new_tokens': 256, 'context_length': 2048, 'temperature': 0.45, "g
 
 
 DEBUG = True
+DEBUG_LEVEL = 1 # 1 para pocos logs, 2 para multiples
 
 
 app = FastAPI(title="Twilio MVP Voice Agent (XTTS + faster-whisper)")
@@ -144,27 +137,35 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Singletons (for MVP)
 ASR = AsrEngine(model_size="medium", device="cuda" if torch.cuda.is_available() else "cpu")
-TTS_ENGINE = Speaker(engine="DG", dg_api_key=DG_API_KEY, device="cuda" if torch.cuda.is_available() else "cpu")
+
 """
 Augmentation and Generation Portion
 """
 retrieval_module = RetrievalModule(database_path=MEDICAL_EXTENDED, hf_token=HF_TOKEN, model_name=VECTOR_MODEL_NAME)
 retrieval_module.initialize(load_db=True, path_to_database="kb_faiss_langchain", score_threshold = 0.34, percentile = 0.9)
-llm_model = Llama(model_path=LLM_MODEL_FILE,
-                         n_ctx=config["context_length"],
-                         # The max sequence length to use - note that longer sequence lengths require much more resources
-                         n_threads=config["threads"],
-                         # The number of CPU threads to use, tailor to your system and the resulting performance
-                         n_gpu_layers=gpu_layers,
-                         temperature=config["temperature"],
-                         n_batch=512,
-                         use_mlock=False,
-                         use_mmap=True,
-                         f16_kv = True,
-                         verbose=False
-                         )
-llm_module = GenerationModuleLlama(llm_model)
+
+if VERSION_PAGA:
+    llm_module = GenerationModuleMistral(api_key=api_key_mistral)
+    TTS_ENGINE = Speaker(engine="DG", dg_api_key=DG_API_KEY, device="cuda" if torch.cuda.is_available() else "cpu")
+else:
+    TTS_ENGINE = Speaker(engine="TTS", device="cuda" if torch.cuda.is_available() else "cpu")
+    llm_model = Llama(model_path=LLM_MODEL_FILE,
+                             n_ctx=config["context_length"],
+                             # The max sequence length to use - note that longer sequence lengths require much more resources
+                             n_threads=config["threads"],
+                             # The number of CPU threads to use, tailor to your system and the resulting performance
+                             n_gpu_layers=gpu_layers,
+                             temperature=config["temperature"],
+                             n_batch=512,
+                             use_mlock=False,
+                             use_mmap=True,
+                             f16_kv = True,
+                             verbose=False
+                             )
+    llm_module = GenerationModuleLlama(llm_model)
 llm_module.initialize(initial_prompt=MESSAGES.INIT_PROMPT_LLAMA, retrieval=retrieval_module, debug=DEBUG)
+
+follow_up_model = IntentionDetector(retrieval=retrieval_module, threshold=0.5, debug=DEBUG)
 
 
 # -----------------------------
@@ -175,7 +176,8 @@ WELCOME_CAMPAING = [MESSAGES.MSG_1, MESSAGES.MSG_2, MESSAGES.MSG_3, MESSAGES.MID
                  MESSAGES.CLOSE_MESSAGE_1, MESSAGES.CLOSE_MESSAGE_2]
 
 GREETING_MSG = ("¡Hola! Mi nombre es Cora, soy el asistente de Medical Laif para resolver tus dudas y es un placer"
-                " atender tu llamada. Dime, ¿tienes alguna duda sobre un servicio o localización de algún centro?")
+                " atender tu llamada. Si en algún momento quieres hablar con un asesor, solo di, quiero hablar con un asesor,"
+                "¿tienes alguna duda sobre un servicio o localización de algún centro?")
 
 
 # -----------------------------
@@ -327,7 +329,7 @@ class TurnDetector:
 
 
 # -----------------------------
-# XTTS wrapper
+# Audio wrappers and methods
 # -----------------------------
 def xtts_tts_f32(text: str, language: str = "es") -> Tuple[np.ndarray, int]:
     """
@@ -336,6 +338,30 @@ def xtts_tts_f32(text: str, language: str = "es") -> Tuple[np.ndarray, int]:
     """
     return TTS_ENGINE.tts_to_wav(text, language)
 
+PRE_RECORDED_AUDIO = {} #
+
+async def init_audio_cache():
+    """Genera los bytes mu-law para frases frecuentes al arrancar."""
+    frases = {
+        "greeting": GREETING_MSG,
+        "filler": "Gracias, dame un momento en lo que verifico lo que me pediste.",
+        "problema_tecnico": "Lo siento, tuve un problema técnico. ¿Podrías repetir eso?",
+        "redirigir": "Entendido, lo comunico con un asesor humano.",
+        "presence": "Aquí sigo atento, ando procesando tu respuesta.",
+        "wait": "No te preocupes, aquí espero. Avísame cuando estés listo.",
+        "out_of_scope": "Por ahora solo puedo ayudarte con información de nuestras sedes y servicios.",
+        "despedida": "Ha sido un gusto ayudarte. ¡Que tengas buen día! ¡Adiós!",
+        "disculpa": "Perdón, no te entendí. ¿Puedes repetirlo?"
+    }
+    print("[INIT] Pre-generando audios de sistema...")
+    for key, text in frases.items():
+        # Generamos el audio síncronamente una sola vez
+        wav, sr = xtts_tts_f32(text, LANGUAGE)
+        wav_8k = resample_f32(wav, sr_in=sr, sr_out=TWILIO_SR)
+        pcm16 = f32_to_pcm16_bytes(wav_8k)
+        mulaw = audioop.lin2ulaw(pcm16, SAMPLE_WIDTH_BYTES)
+        PRE_RECORDED_AUDIO[key] = mulaw
+    print("[INIT] Audios listos.")
 
 
 # -----------------------------
@@ -370,7 +396,6 @@ async def twilio_answer(request: Request):
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="es-MX">Hola. Estoy conectando con el agente.</Say>
     <Connect>
         <Stream url="{ws_url}"/>
     </Connect>
@@ -385,16 +410,19 @@ async def twilio_answer(request: Request):
 # -----------------------------
 # Human Transfer
 # -----------------------------
-async def transfer_to_human(call_sid: str, target_number: str = "+52XXXXXXXXXX"):
+async def transfer_to_human(call_sid: str):
     """
     Redirecciona la llamada activa de Twilio a un número de call center,
     sacándola del Media Stream actual.
+    target_Number es el destino para llamar, se elegira de un pool de numeros libres
     """
+    target_number = "5566093868"
+
     try:
         # El TwiML de respuesta saca a la llamada del WebSocket y la rutea
         # Puedes usar <Dial> para un número específico
         client.calls(call_sid).update(
-            twiml=f'<Response><Say language="es-MX">Un momento, le transfiero con un asesor humano.</Say><Dial>{target_number}</Dial></Response>'
+            twiml=f'<Response><Dial>{target_number}</Dial></Response>'
         )
         if DEBUG:
             print(f"[HANDOFF] Llamada {call_sid} transferida a {target_number}")
@@ -422,7 +450,7 @@ async def twilio_start_call(payload: dict):
             status_code=400,
         )
     try:
-
+        await init_audio_cache()
         call = client.calls.create(
             to=to_number,
             from_=TWILIO_FROM_NUMBER,
@@ -467,6 +495,7 @@ async def twilio_ws(ws: WebSocket):
     processing_turn = False
 
     ws_send_lock = asyncio.Lock()
+
 
     async def ws_send(obj: dict):
         async with ws_send_lock:
@@ -613,73 +642,11 @@ async def twilio_ws(ws: WebSocket):
         bot_task = new_task  # Para el control global de cancelación
         last_tts_task = new_task  # Para el encadenamiento del stream
 
-    # Funcion guardada para comparativa, no usar de momento.
-    async def handle_user_turn(pcm16_turn: bytes, call_sid: str):
-        """ASR -> agent reply -> next prompt / goodbye."""
-        nonlocal turn_idx
-
-        # Convert 8k PCM16 bytes -> float32 -> 16k for ASR
-        wav_8k = pcm16_bytes_to_f32(pcm16_turn)
-        peak = float(np.max(np.abs(wav_8k))) if wav_8k.size else 0.0
-        if peak >= 0.2:
-            wav_8k = (wav_8k / peak) * 0.9
-        wav_16k = resample_f32(wav_8k, sr_in=TWILIO_SR, sr_out=16000)
-        if DEBUG:
-            print("[ASR] peak:", peak, "secs:", len(wav_8k) / TWILIO_SR)
-        # ASR (faster-whisper)
-        # tmp_path = save_wav_tmp_float32_16k(wav_16k, sr=16000)
-        segments, _ = ASR.model.transcribe(wav_16k, language=LANGUAGE, vad_filter=True)
-        text = " ".join(seg.text.strip() for seg in segments)
-
-        if not text:
-            await start_speaking("Perdón, no te entendí. ¿Puedes repetirlo?")
-            return
-        if DEBUG:
-            print("[ASR] text:", text)
-
-        # Consumo del Strem
-        reply = agent_reply(text, turn_idx)  # [0] = real reply, [1] = finish flag
-
-        if "[TRANSFER_CALL]" in reply[0]:
-            # 1. Obtener el Call SID
-            if call_sid:
-                await start_speaking("Entendido, lo comunico con un asesor humano en este momento.")
-                # Esperamos un poco para que el TTS se envíe o lo ejecutamos post-transfer
-                await transfer_to_human(call_sid)
-                await ws.close()
-                return
-
-        if reply[1]: ## Closing message
-            # Wait for TTS task to finish sending before closing
-            await start_speaking(reply[0])
-            if bot_task:
-                try:
-                    await bot_task
-                except asyncio.CancelledError:
-                    pass
-            await ws.close()
-            return
-        # Then next question / goodbye per turn index
-        else:
-            if turn_idx <= 4:
-                await start_speaking(reply[0])
-                turn_idx += 1
-            elif turn_idx == 5:
-                await start_speaking(reply[0])
-                # Wait for TTS task to finish sending before closing
-                if bot_task:
-                    try:
-                        await bot_task
-                    except asyncio.CancelledError:
-                        pass
-                await ws.close()
-                return
-
     async def handle_user_turn_stream(pcm16_turn: bytes, call_sid: str, turn_data: dict):
         """ASR -> agent reply -> next prompt / goodbye."""
         nonlocal turn_idx, bot_task
 
-        # --- PARTE 1: ASR EN MEMORIA ---
+        # --- 1: ASR EN MEMORIA ---
         wav_8k = pcm16_bytes_to_f32(pcm16_turn)
         peak = float(np.max(np.abs(wav_8k))) if wav_8k.size else 0.0
         if peak >= 0.2:
@@ -694,62 +661,96 @@ async def twilio_ws(ws: WebSocket):
         if not text:
             # Aquí is_partial=False porque es una respuesta de error única
             turn_data["was_misunderstood"] = True
-            await start_speaking("Perdón, no te entendí. ¿Puedes repetirlo?", is_partial=False, turn_data=None)
+            await send_mulaw_audio(PRE_RECORDED_AUDIO["disculpa"], turn_data=turn_data)
             return
         if DEBUG:
             print(f"[ASR] User said: {text}")
-
-        # Decir un mensaje de retroalimentacion para el usuario.
-        await start_speaking("Gracias, dame un momento en lo que verifico lo que me pediste.", is_partial=False)
-
-        turn_data["t1"] = time.perf_counter() # Get the time taken to transcribe message
-        turn_data["user_text"] = text
-        # --- PARTE 2: CONSUMO DEL LLM STREAM ---
-        full_response_text = ""
+        # 2: GATEKEEPER (EL CEREBRO DE LA MÁQUINA DE ESTADOS) ---
         end_flag = False
-        # Creamos un bloque try para manejar la interrupción total si fuera necesario
-
-        t2_captured = False # Flag to capture first llm sentence.
-
-        async for response in llm_module.rag_answer_stream(text):
-            sentence = response['text']
-
-            # CAPTURA DE T2: Solo ocurre en el primer paquete que contenga texto
-            if not t2_captured and sentence.strip():
-                t2_captured = True
-                turn_data["t2"] = time.perf_counter()
-
-            if not sentence:
-                continue
-
-            if response['end_session']:
-                print("[DEBUG] Terminando sesion")
-                full_response_text += " Entendido, muchas gracias por tu llamada, adios."
-                return
-            elif "TRANSFER_CALL" in sentence:
+        # Detección de cierre.
+        if follow_up_model.detect_exit_intent(text):
+            end_flag = True
+        # Safeguards
+        intent = follow_up_model.get_semantic_intent(text)
+        if not end_flag:
+            if intent == "rag_required":
+                # -- RAG / LLM ---
+                # ocurre si el intent fue un RAG required, dice un mensaje de retroalimentacion para el usuario.
+                await  send_mulaw_audio(PRE_RECORDED_AUDIO["filler"], turn_data=turn_data)
+                # Forzamos que el loop registre la tarea y empiece a enviarla
+                await asyncio.sleep(0.01)
+            elif intent == "asesor":
                 if DEBUG:
                     print("[DEBUG] Transfiriendo a un asesor humano")
                 if call_sid:
-                    await start_speaking("Entendido, lo comunico con un asesor humano.", is_partial=False)
+                    await send_mulaw_audio(PRE_RECORDED_AUDIO["redirigir"], turn_data=turn_data)
                     await transfer_to_human(call_sid)
                 await ws.close()
                 return
+
             else:
-                # Hablamos la oración. Usamos is_partial=True para que se encole/procese fluído.
-                await start_speaking(sentence, is_partial=True, turn_data=turn_data)
-                full_response_text += " " + sentence
-                if DEBUG:
-                    print("[ASR] sentence text:", sentence)
+                responses = {
+                    "repeat": f"Claro, te repito: {llm_module.memoria.get_last_assistant_response()}",
+                    "presence": "Aquí sigo atento, ando procesando tu respuesta.",
+                    "wait": "No te preocupes, aquí espero. Avísame cuando estés listo.",
+                    "out_of_scope": "Por ahora solo puedo ayudarte con información de nuestras sedes y servicios.",
+                    "audio_complaint": f"Lamento los problemas de audio, intentaré hablar más claro, repito lo anterior, {llm_module.memoria.get_last_assistant_response()}",
+                }
 
-        turn_data["bot_text"] = full_response_text
-        turn_data["t_llm_end"] = time.perf_counter()
-        call_metrics.log_turn(turn_data)
+                await start_speaking(responses[intent], is_partial=False)
+                # máquina de estados:
+                if intent == "presence":
+                    # Caso especial: NO hacemos return.
+                    # Dejamos que el flujo continúe hacia el RAG para que no se pierda la consulta original.
+                    pass
+                else:
+                    # Para repetir, esperar o quejas, terminamos el turno aquí.
+                    return
 
-        turn_idx += 1
-        if DEBUG:
-            print("[DEBUG] Turno en cuestion: ", turn_idx)
-        if "adiós" in full_response_text.lower() or turn_idx > 10 or end_flag:
+
+
+            turn_data["t1"] = time.perf_counter() # Get the time taken to transcribe message
+            turn_data["user_text"] = text
+            # --- PARTE 2: CONSUMO DEL LLM STREAM ---
+            full_response_text = ""
+            end_flag = False
+            # Creamos un bloque try para manejar la interrupción total si fuera necesario
+
+            t2_captured = False # Flag to capture first llm sentence.
+
+            async for response in llm_module.rag_answer_stream(text):
+                sentence = response['text']
+
+                # CAPTURA DE T2: Solo ocurre en el primer paquete que contenga texto
+                if not t2_captured and sentence.strip():
+                    t2_captured = True
+                    turn_data["t2"] = time.perf_counter()
+
+                if not sentence:
+                    continue
+                else:
+                    if sentence == "out_of_scope":
+                        await send_mulaw_audio(PRE_RECORDED_AUDIO["out_of_scope"], turn_data=turn_data)
+                    else:
+                        # Hablamos la oración. Usamos is_partial=True para que se encole/procese fluído.
+                        await start_speaking(sentence, is_partial=True, turn_data=turn_data)
+                    full_response_text += " " + sentence
+                    if DEBUG:
+                        print("[ASR] sentence text:", sentence)
+
+            turn_data["bot_text"] = full_response_text
+            turn_data["t_llm_end"] = time.perf_counter()
+            call_metrics.log_turn(turn_data)
+
+            turn_idx += 1
+            if DEBUG:
+                print("[DEBUG] Turno en cuestion: ", turn_idx)
+
+            if "adiós" in full_response_text.lower():
+                end_flag = True
+        if end_flag:
             # Esperamos a que termine de hablar antes de colgar
+            await send_mulaw_audio(PRE_RECORDED_AUDIO["despedida"], turn_data=turn_data)
             if bot_task and not bot_task.done():
                 try:
                     await bot_task
@@ -758,7 +759,7 @@ async def twilio_ws(ws: WebSocket):
             await asyncio.sleep(1.5)
             # --- PARTE 3: GESTIÓN DE ESTADOS Y CIERRE ---
             if DEBUG:
-                print("[WS] Cerrando conexión por fin de turno o despedida.")
+                print("[WS] Cerrando conexión por fin de turnos o despedida.")
             await ws.close()
 
     async def safe_handle_turn(audio: bytes, sid: str):
@@ -787,7 +788,7 @@ async def twilio_ws(ws: WebSocket):
             print(f"[ERROR] Fallo en el flujo del turno: {e}")
             turn_data["was_misunderstood"] = True
             # Opcional: Enviar un mensaje de error vocal al usuario
-            await start_speaking("Lo siento, tuve un problema técnico. ¿Podrías repetir eso?", is_partial=False)
+            await send_mulaw_audio(PRE_RECORDED_AUDIO["problema_tecnico"], turn_data)
         finally:
             processing_turn = False
 
@@ -824,15 +825,15 @@ async def twilio_ws(ws: WebSocket):
                     print("TWILIO WS START:", msg["start"])
                     print("[WS] Stream SID:", stream_sid)
                     print("[WS] Call SID:", call_sid)
-                await start_speaking(GREETING_MSG, is_partial=False)
+                await send_mulaw_audio(PRE_RECORDED_AUDIO["greeting"])
                 continue
 
-            if event == "media":
+            elif event == "media":
                 if not stream_sid or processing_turn or bot_speaking or (time.perf_counter() - call_metrics.start_time < 2.0):
                     # ignore until start arrives
                     continue
 
-                if DEBUG:
+                if DEBUG and DEBUG_LEVEL == 2:
                     print("[DEBUG] Starting second turn")
 
                 payload_b64 = msg["media"]["payload"]
@@ -867,7 +868,7 @@ async def twilio_ws(ws: WebSocket):
                     except Exception:
                         continue
 
-                if r > 100 and DEBUG:  # Solo printea si hay algo de ruido
+                if r > 100 and DEBUG and DEBUG_LEVEL==2:  # Solo printea si hay algo de ruido
                     print(f"[SENSOR] RMS: {int(r)} | VAD: {detector.vad.is_speech(frame_bytes, TWILIO_SR)} | Speaking: {bot_speaking}")
                 finished, turn_audio = detector.add_frame(frame_bytes)
 
@@ -888,18 +889,30 @@ async def twilio_ws(ws: WebSocket):
                 print("TWILIO WS STOP")
                 break
 
+    except WebSocketDisconnect:
+        if DEBUG: print("[WS] Twilio desconectó la llamada.")
+    except RuntimeError as e:
+        if "is not connected" in str(e):
+            if DEBUG: print("[DEBUG] Cierre de socket controlado.")
+        else:
+            raise e
     except Exception as e:
         # Logs de error
         print(f"[CRITICAL] Error en loop de WebSocket: {type(e).__name__} - {e}")
     finally:
-        # Cancel bot task if still running
+        # Verificamos si el bot_task sigue vivo para cancelarlo y evitar fugas
         if bot_task and not bot_task.done():
             bot_task.cancel()
+
+        # REGLA DE ORO: Solo cerramos si el estado es exactamente CONNECTED (valor 1)
+        # Si el estado es 2 (DISCONNECTING) o 3 (DISCONNECTED), ya no podemos llamar a close()
+        from starlette.websockets import WebSocketState
+
+        if ws.client_state == WebSocketState.CONNECTED:
             try:
-                await bot_task
-            except asyncio.CancelledError:
-                pass
-        try:
-            await ws.close()
-        except Exception:
-            pass
+                if DEBUG: print("[WS] Cerrando conexión de forma activa...")
+                await ws.close()
+            except Exception as e:
+                if DEBUG: print(f"[DEBUG] Error ignorado al cerrar: {e}")
+        else:
+            if DEBUG: print(f"[DEBUG] Socket ya no está conectado (Estado: {ws.client_state.name}), saltando close().")
