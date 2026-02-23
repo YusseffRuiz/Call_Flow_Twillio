@@ -970,20 +970,20 @@ def apply_small_boosts(pairs,  # list[(Document, score_float)] de los results
         if service:
             svcs = meta.get("servicios_lista") or []
             if isinstance(svcs, (list, tuple)) and service in svcs:
-                score += BOOST_SERVICE
+                score -= BOOST_SERVICE
 
         if municipality:
             if str(meta.get("municipio","")).lower() == str(municipality).lower():
-                score += BOOST_MUNI
+                score -= BOOST_MUNI
 
         if state:
             if str(meta.get("estado","")).lower() == str(state).lower():
-                score += BOOST_STATE
+                score -= BOOST_STATE
 
         out.append((d, score))
 
     # Reordenar por nuevo score
-    out.sort(key=lambda x: x[1], reverse=True)
+    out.sort(key=lambda x: x[1], reverse=False)
     return out
 
 def _norm_simple(s: str) -> str:

@@ -87,8 +87,8 @@ DEFAULT_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER", "")     # optional for quick t
 LANGUAGE = os.getenv("AGENT_LANGUAGE", "es")
 
 # Turn-taking / VAD
-SILENCE_MS_END_TURN = int(os.getenv("SILENCE_MS_END_TURN", "400"))
-MAX_TURN_SECONDS = float(os.getenv("MAX_TURN_SECONDS", "10"))
+SILENCE_MS_END_TURN = 800
+MAX_TURN_SECONDS = 10.0
 
 # Twilio Media Streams audio format
 TWILIO_SR = 8000
@@ -98,6 +98,8 @@ SAMPLE_WIDTH_BYTES = 2  # PCM16
 FRAME_MS = 20
 FRAME_SAMPLES_8K = int(TWILIO_SR * (FRAME_MS / 1000.0))  # 160 samples @ 8kHz
 FRAME_BYTES_PCM16 = FRAME_SAMPLES_8K * SAMPLE_WIDTH_BYTES  # 320 bytes PCM16
+
+NOISE_RMS = 600
 
 LLM_MODEL_FILE = "../HF_Agents/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -121,8 +123,10 @@ config = {'max_new_tokens': 256, 'context_length': 2048, 'temperature': 0.45, "g
                           "threads": os.cpu_count()}
 
 
-DEBUG = True
-DEBUG_LEVEL = 1 # 1 para pocos logs, 2 para multiples
+
+DEBUG_LEVEL = 2 # 1 para pocos logs, 2 para multiples
+if DEBUG_LEVEL > 0:
+    DEBUG=True
 
 
 app = FastAPI(title="Twilio MVP Voice Agent (XTTS + faster-whisper)")
@@ -180,32 +184,11 @@ GREETING_MSG = ("¡Hola! Mi nombre es Cora, soy el asistente de Medical Laif par
 # Helpers: audio codec conversions for Twilio. Helper code adapted to match
 # -----------------------------
 
-def save_wav_tmp_float32_16k(wav_16k: np.ndarray, sr: int = 16000) -> str:
-    # Asegura float32 mono
-    if wav_16k.ndim > 1:
-        wav_16k = wav_16k.squeeze()
-    wav_16k = wav_16k.astype(np.float32, copy=False)
-
-    # clamp por seguridad
-    wav_16k = np.clip(wav_16k, -1.0, 1.0)
-
-    tmp_dir = tempfile.gettempdir()
-    path = os.path.join(tmp_dir, f"tw_{uuid.uuid4().hex}.wav")
-
-    # Guardar como PCM_16, que es lo que tu pipeline ya usa
-    sf.write(path, wav_16k, sr, subtype="PCM_16")
-    return path
-
 def ulaw_b64_to_pcm16(payload_b64: str) -> bytes:
     """Twilio sends 8kHz mu-law (8-bit) base64. Convert to PCM16 bytes."""
     mulaw = base64.b64decode(payload_b64)
     pcm16 = audioop.ulaw2lin(mulaw, SAMPLE_WIDTH_BYTES)  # bytes PCM16
     return pcm16
-
-def pcm16_to_ulaw_b64(pcm16: bytes) -> str:
-    """Convert PCM16 bytes to mu-law base64 for Twilio playback."""
-    mulaw = audioop.lin2ulaw(pcm16, SAMPLE_WIDTH_BYTES)
-    return base64.b64encode(mulaw).decode("ascii")
 
 def rms_pcm16(pcm16: bytes) -> float:
     import array, math
@@ -246,7 +229,7 @@ class TurnDetector:
     max_turn_seconds: float = MAX_TURN_SECONDS
     sample_rate: int = TWILIO_SR
     frame_ms: int = FRAME_MS
-    min_speech_frames: int = 2
+    min_speech_frames: int = 3
     rms_speech_threshold: int = 500
 
     def __post_init__(self):
@@ -336,7 +319,7 @@ def xtts_tts_f32(text: str, language: str = "es") -> Tuple[np.ndarray, int]:
 
 PRE_RECORDED_AUDIO = {} #
 
-async def init_audio_cache():
+def init_audio_cache():
     """Genera los bytes mu-law para frases frecuentes al arrancar."""
     frases = {
         "greeting": GREETING_MSG,
@@ -358,6 +341,8 @@ async def init_audio_cache():
         mulaw = audioop.lin2ulaw(pcm16, SAMPLE_WIDTH_BYTES)
         PRE_RECORDED_AUDIO[key] = mulaw
     print("[INIT] Audios listos.")
+
+init_audio_cache()
 
 
 # -----------------------------
@@ -538,8 +523,6 @@ async def twilio_ws(ws: WebSocket):
 
                 payload_b64 = base64.b64encode(chunk).decode("ascii")
                 msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": payload_b64}}
-                if turn_data and turn_data.get("t3") is not None:
-                    turn_data["t3"] = time.perf_counter()
                 await ws_send(msg)
 
                 sent_frames += 1
@@ -569,9 +552,7 @@ async def twilio_ws(ws: WebSocket):
             wav_8k = resample_f32(wav, sr_in=sr, sr_out=TWILIO_SR)
             pcm16 = f32_to_pcm16_bytes(wav_8k)
             mulaw = audioop.lin2ulaw(pcm16, SAMPLE_WIDTH_BYTES)
-
-            # Envío a Twilio
-            if turn_data is not None:
+            if turn_data:
                 turn_data["t3"] = time.perf_counter()
             await send_mulaw_audio(mulaw, turn_data=turn_data)
         except asyncio.CancelledError:
@@ -616,8 +597,9 @@ async def twilio_ws(ws: WebSocket):
         # Capturamos la referencia actual de la cola ANTES de crear la nueva tarea
         prev_task = last_tts_task
 
-        async def speech_wrapper(turn_data=None):
-            nonlocal bot_pending
+        async def speech_wrapper():
+            nonlocal bot_pending, turn_data
+
             try:
                 # Si hay una tarea previa en la cola, esperamos a que termine
                 if prev_task and not prev_task.done():
@@ -625,6 +607,8 @@ async def twilio_ws(ws: WebSocket):
 
                 # Ejecutamos la síntesis y envío actual
                 await stream_text_to_speech(text, turn_data=turn_data)
+                if DEBUG_LEVEL >= 2:
+                    print("[DEBUG] turn data after t3: \n", turn_data)
             except asyncio.CancelledError:
                 # Si se cancela durante la espera o el proceso, propagamos
                 raise
@@ -634,14 +618,14 @@ async def twilio_ws(ws: WebSocket):
                     bot_pending = False
 
         # 3. Creación y asignación de la tarea
-        new_task = asyncio.create_task(speech_wrapper(turn_data=turn_data))
+        new_task = asyncio.create_task(speech_wrapper())
         bot_task = new_task  # Para el control global de cancelación
         last_tts_task = new_task  # Para el encadenamiento del stream
 
     async def handle_user_turn_stream(pcm16_turn: bytes, call_sid: str, turn_data: dict):
         """ASR -> agent reply -> next prompt / goodbye."""
         nonlocal turn_idx, bot_task
-
+        speak_logging=False
         # --- 1: ASR EN MEMORIA ---
         wav_8k = pcm16_bytes_to_f32(pcm16_turn)
         peak = float(np.max(np.abs(wav_8k))) if wav_8k.size else 0.0
@@ -657,7 +641,7 @@ async def twilio_ws(ws: WebSocket):
         if not text:
             # Aquí is_partial=False porque es una respuesta de error única
             turn_data["was_misunderstood"] = True
-            await send_mulaw_audio(PRE_RECORDED_AUDIO["disculpa"], turn_data=turn_data)
+            await send_mulaw_audio(PRE_RECORDED_AUDIO["disculpa"], turn_data=None)
             return
         if DEBUG:
             print(f"[ASR] User said: {text}")
@@ -672,14 +656,15 @@ async def twilio_ws(ws: WebSocket):
             if intent == "rag_required":
                 # -- RAG / LLM ---
                 # ocurre si el intent fue un RAG required, dice un mensaje de retroalimentacion para el usuario.
-                await  send_mulaw_audio(PRE_RECORDED_AUDIO["filler"], turn_data=turn_data)
+                await  send_mulaw_audio(PRE_RECORDED_AUDIO["filler"], turn_data=None)
+                speak_logging = True
                 # Forzamos que el loop registre la tarea y empiece a enviarla
                 await asyncio.sleep(0.01)
             elif intent == "asesor":
                 if DEBUG:
                     print("[DEBUG] Transfiriendo a un asesor humano")
                 if call_sid:
-                    await send_mulaw_audio(PRE_RECORDED_AUDIO["redirigir"], turn_data=turn_data)
+                    await send_mulaw_audio(PRE_RECORDED_AUDIO["redirigir"], turn_data=None)
                     await transfer_to_human(call_sid)
                 await ws.close()
                 return
@@ -698,6 +683,7 @@ async def twilio_ws(ws: WebSocket):
                 if intent == "presence":
                     # Caso especial: NO hacemos return.
                     # Dejamos que el flujo continúe hacia el RAG para que no se pierda la consulta original.
+                    speak_logging = True
                     pass
                 else:
                     # Para repetir, esperar o quejas, terminamos el turno aquí.
@@ -726,7 +712,7 @@ async def twilio_ws(ws: WebSocket):
                     continue
                 else:
                     if sentence == "out_of_scope":
-                        await send_mulaw_audio(PRE_RECORDED_AUDIO["out_of_scope"], turn_data=turn_data)
+                        await send_mulaw_audio(PRE_RECORDED_AUDIO["out_of_scope"], turn_data=None)
                     else:
                         # Hablamos la oración. Usamos is_partial=True para que se encole/procese fluído.
                         await start_speaking(sentence, is_partial=True, turn_data=turn_data)
@@ -735,6 +721,19 @@ async def twilio_ws(ws: WebSocket):
                         print("[ASR] sentence text:", sentence)
 
             turn_data["bot_text"] = full_response_text
+
+            if speak_logging:
+                timeout_limit = 50  # 5 segundos máximo (50 * 0.1s)
+                count = 0
+                if DEBUG: print("[DEBUG] Esperando a T3 para el log...")
+
+                while turn_data.get("t3", 0) == 0 and count < timeout_limit:
+                    await asyncio.sleep(0.1)
+                    count += 1
+
+                if turn_data.get("t3") == 0:
+                    if DEBUG: print("[WARNING] Timeout alcanzado: T3 se guardará como el timer actual")
+                    turn_data["t3"] = time.perf_counter()
             turn_data["t_llm_end"] = time.perf_counter()
             call_metrics.log_turn(turn_data)
 
@@ -746,7 +745,7 @@ async def twilio_ws(ws: WebSocket):
                 end_flag = True
         if end_flag:
             # Esperamos a que termine de hablar antes de colgar
-            await send_mulaw_audio(PRE_RECORDED_AUDIO["despedida"], turn_data=turn_data)
+            await send_mulaw_audio(PRE_RECORDED_AUDIO["despedida"], turn_data=None)
             if bot_task and not bot_task.done():
                 try:
                     await bot_task
@@ -784,7 +783,7 @@ async def twilio_ws(ws: WebSocket):
             print(f"[ERROR] Fallo en el flujo del turno: {e}")
             turn_data["was_misunderstood"] = True
             # Opcional: Enviar un mensaje de error vocal al usuario
-            await send_mulaw_audio(PRE_RECORDED_AUDIO["problema_tecnico"], turn_data)
+            await send_mulaw_audio(PRE_RECORDED_AUDIO["problema_tecnico"])
         finally:
             processing_turn = False
 
@@ -829,7 +828,7 @@ async def twilio_ws(ws: WebSocket):
                     # ignore until start arrives
                     continue
 
-                if DEBUG and DEBUG_LEVEL == 2:
+                if DEBUG_LEVEL >= 3:
                     print("[DEBUG] Starting second turn")
 
                 payload_b64 = msg["media"]["payload"]
@@ -848,7 +847,7 @@ async def twilio_ws(ws: WebSocket):
                 if bot_speaking:
                     try:
                         # gate por RMS para no disparar por ruido
-                        if r > 350 and detector.vad.is_speech(frame_bytes, TWILIO_SR):
+                        if r > NOISE_RMS and detector.vad.is_speech(frame_bytes, TWILIO_SR):
                             barge_speech_hits += 1
                             if barge_speech_hits >= BARGE_MIN_HITS:
                                 await send_clear()
@@ -864,7 +863,7 @@ async def twilio_ws(ws: WebSocket):
                     except Exception:
                         continue
 
-                if r > 100 and DEBUG and DEBUG_LEVEL==2:  # Solo printea si hay algo de ruido
+                if r > 100 and DEBUG_LEVEL>=2:  # Solo printea si hay algo de ruido
                     print(f"[SENSOR] RMS: {int(r)} | VAD: {detector.vad.is_speech(frame_bytes, TWILIO_SR)} | Speaking: {bot_speaking}")
                 finished, turn_audio = detector.add_frame(frame_bytes)
 

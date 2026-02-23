@@ -515,7 +515,10 @@ class GenerationModuleMistral(GenerationModuleLlama):
             model=self.model_name,
             messages=messages,
             temperature=0.2,
-            max_tokens=512
+            max_tokens=150,
+            frequency_penalty=1.1,
+            presence_penalty=0.6,
+            top_p=0.9,
         )
         t1 = time.perf_counter()
 

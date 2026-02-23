@@ -73,5 +73,5 @@ class CallMetrics:
         self._save_to_jsonl(turn_data)
 
     def _save_to_jsonl(self, data):
-        with open(f"logs/call_{self.call_id}.jsonl", "a", encoding="utf-8") as f:
+        with open(f"logs/call_{self.call_id}.json", "a", encoding="utf-8") as f:
             f.write(json.dumps(data) + "\n")
