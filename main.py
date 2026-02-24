@@ -136,7 +136,7 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
 # Singletons (for MVP)
-ASR = AsrEngine(model_size="medium", device="cuda" if torch.cuda.is_available() else "cpu")
+ASR = AsrEngine(model_size="large", device="cuda" if torch.cuda.is_available() else "cpu")
 
 """
 Augmentation and Generation Portion
