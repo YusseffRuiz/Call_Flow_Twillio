@@ -1,7 +1,7 @@
-import math
 from typing import Tuple
-# import whisper
+
 from faster_whisper import WhisperModel
+from deepgram import DeepgramClient
 
 # Patrones clínicos mínimos de ejemplo (puedes ampliarlos luego)
 MED_PATTERNS = [
@@ -19,7 +19,7 @@ class AsrEngine:
         """
         # compute_type "int8_float16" funciona bien en CPU modernas; en GPU puedes usar "float16"
         # self.model = whisper.load_model(model_size, device=device)
-        self.model = WhisperModel(model_size, device=device, compute_type="int8")
+        self.model = WhisperModel(model_size, device=device, compute_type="int8_float16")
 
 
     def transcribe_file(self, audio: str, language: str = "es", fp16=False, without_timestamps=True
@@ -57,3 +57,41 @@ class AsrEngine:
         # text = result.get("text", "")
         # confidence = 0.90 if text else 0.0 # placeholder; faster-whisper no expone prob estable
         return text, confidence, None
+
+
+class DeepgramAsrEngine:
+    def __init__(self, api_key: str, model: str = "nova-2", language: str = "es"):
+        self.api_key = api_key
+        # Inicializamos el cliente principal
+        self.client = DeepgramClient(api_key=api_key)
+        self.model = model
+        self.language = language
+
+    def transcribe_audio(self, audio_bytes: bytes):
+        """
+        Transcribe audio recolectado del stream de Twilio.
+        """
+        try:
+            source = {'buffer': audio_bytes}
+
+            options = {
+                "model": self.model,
+                "language": self.language,
+                "smart_format": True,
+                "encoding": "linear16",  # Formato nativo de Twilio
+                "sample_rate": 8000,  # Frecuencia de telefonía
+                "container": "none"  # Audio crudo sin cabecera WAV
+            }
+
+            # Llamada directa al SDK v3
+            response = self.client.listen.prerecorded.v("1").transcribe_file(source, options)
+
+            # Navegación segura por el JSON de respuesta
+            alternatives = response.results.channels[0].alternatives[0]
+            text = alternatives.transcript
+            confidence = float(alternatives.confidence)
+
+            return text, confidence
+        except Exception as e:
+            print(f"❌ [Deepgram Error] {e}")
+            return "", 0.0

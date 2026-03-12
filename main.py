@@ -46,6 +46,7 @@ import webrtcvad
 import torchaudio
 import torch
 from dotenv import load_dotenv
+import gc
 
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import Response, JSONResponse
@@ -55,7 +56,7 @@ from twilio.rest import Client
 
 
 # Your existing modules (from your repo)
-from AudioTranscription.ASREngine import AsrEngine
+from AudioTranscription.ASREngine import AsrEngine, DeepgramAsrEngine
 from RAG_CORE.generation_module import GenerationModuleLlama, IntentionDetector, GenerationModuleMistral
 from RAG_CORE.retrieval_module import RetrievalModule
 from voices.TTS_engine import Speaker, speaker_wav_path  # uses XTTS + speaker_wav_path
@@ -124,7 +125,7 @@ config = {'max_new_tokens': 256, 'context_length': 2048, 'temperature': 0.45, "g
 
 
 
-DEBUG_LEVEL = 2 # 1 para pocos logs, 2 para multiples
+DEBUG_LEVEL = 1 # 1 para pocos logs, 2 para multiples
 if DEBUG_LEVEL > 0:
     DEBUG=True
 
@@ -134,10 +135,6 @@ app = FastAPI(title="Twilio MVP Voice Agent (XTTS + faster-whisper)")
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-
-# Singletons (for MVP)
-ASR = AsrEngine(model_size="large", device="cuda" if torch.cuda.is_available() else "cpu")
-
 """
 Augmentation and Generation Portion
 """
@@ -145,9 +142,12 @@ retrieval_module = RetrievalModule(database_path=MEDICAL_EXTENDED, hf_token=HF_T
 retrieval_module.initialize(load_db=True, path_to_database="kb_faiss_langchain", score_threshold = 0.34, percentile = 0.9)
 
 if VERSION_PAGA:
+    ASR = DeepgramAsrEngine(api_key=DG_API_KEY)
     llm_module = GenerationModuleMistral(api_key=api_key_mistral)
     TTS_ENGINE = Speaker(engine="DG", dg_api_key=DG_API_KEY, device="cuda" if torch.cuda.is_available() else "cpu")
 else:
+    ASR = AsrEngine(model_size="medium",
+                    device="cuda" if torch.cuda.is_available() else "cpu")
     TTS_ENGINE = Speaker(engine="TTS", device="cuda" if torch.cuda.is_available() else "cpu")
     llm_model = Llama(model_path=LLM_MODEL_FILE,
                              n_ctx=config["context_length"],
@@ -431,7 +431,7 @@ async def twilio_start_call(payload: dict):
             status_code=400,
         )
     try:
-        await init_audio_cache()
+        # await init_audio_cache()
         call = client.calls.create(
             to=to_number,
             from_=TWILIO_FROM_NUMBER,
@@ -626,17 +626,31 @@ async def twilio_ws(ws: WebSocket):
         """ASR -> agent reply -> next prompt / goodbye."""
         nonlocal turn_idx, bot_task
         speak_logging=False
-        # --- 1: ASR EN MEMORIA ---
-        wav_8k = pcm16_bytes_to_f32(pcm16_turn)
-        peak = float(np.max(np.abs(wav_8k))) if wav_8k.size else 0.0
-        if peak >= 0.2:
-            wav_8k = (wav_8k / peak) * 0.9
-        wav_16k = resample_f32(wav_8k, sr_in=TWILIO_SR, sr_out=16000)
-        if DEBUG:
-            print("[DEBUG] Audio gathered, starting transcribe")
-        # Inferencia de Faster-Whisper
-        segments, _ = ASR.model.transcribe(wav_16k, language=LANGUAGE, vad_filter=True)
-        text = " ".join(seg.text.strip() for seg in segments)
+        if VERSION_PAGA:
+            text, confidence = ASR.transcribe_audio(pcm16_turn)
+            if DEBUG:
+                print(text)
+        else:
+            # --- 1: ASR EN MEMORIA ---
+            wav_8k = pcm16_bytes_to_f32(pcm16_turn)
+            peak = float(np.max(np.abs(wav_8k))) if wav_8k.size else 0.0
+            if peak >= 0.2:
+                wav_8k = (wav_8k / peak) * 0.9
+            wav_16k = resample_f32(wav_8k, sr_in=TWILIO_SR, sr_out=16000)
+            if DEBUG:
+                print("[DEBUG] Audio gathered, starting transcribe")
+            # Inferencia de Faster-Whisper
+            segments, _ = ASR.model.transcribe(wav_16k, language=LANGUAGE,
+                                               vad_filter=True)  ## Ocurre la transcripción de Audio a Texto
+            text = " ".join(seg.text.strip() for seg in segments)
+            del segments  # Eliminamos la referencia al objeto de FasterWhisper
+
+        turn_data["t1"] = time.perf_counter()  # Get the time taken to transcribe message
+
+        # Manejo de memoria
+        gc.collect()  # Recolector de basura de Python
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Liberar memoria de video
 
         if not text:
             # Aquí is_partial=False porque es una respuesta de error única
@@ -670,6 +684,7 @@ async def twilio_ws(ws: WebSocket):
                 return
 
             else:
+                turn_data["t2"] = time.perf_counter()
                 responses = {
                     "repeat": f"Claro, te repito: {llm_module.memoria.get_last_assistant_response()}",
                     "presence": "Aquí sigo atento, ando procesando tu respuesta.",
@@ -678,20 +693,22 @@ async def twilio_ws(ws: WebSocket):
                     "audio_complaint": f"Lamento los problemas de audio, intentaré hablar más claro, repito lo anterior, {llm_module.memoria.get_last_assistant_response()}",
                 }
 
-                await start_speaking(responses[intent], is_partial=False)
+                await start_speaking(responses[intent], is_partial=False, turn_data=turn_data)
                 # máquina de estados:
                 if intent == "presence":
-                    # Caso especial: NO hacemos return.
-                    # Dejamos que el flujo continúe hacia el RAG para que no se pierda la consulta original.
-                    speak_logging = True
-                    pass
+                    # Registramos el turno de repetición antes de salir
+                    turn_data["bot_text"] = f"REPETICIÓN: {responses[intent]}"
+                    # Esperar a T3 como ya lo haces
+                    while turn_data["t3"] == 0: await asyncio.sleep(0.1)
+                    call_metrics.log_turn(turn_data)
+                    return  # Salimos del handler para que no cierre el socket
                 else:
                     # Para repetir, esperar o quejas, terminamos el turno aquí.
                     return
 
 
 
-            turn_data["t1"] = time.perf_counter() # Get the time taken to transcribe message
+
             turn_data["user_text"] = text
             # --- PARTE 2: CONSUMO DEL LLM STREAM ---
             full_response_text = ""

@@ -200,7 +200,9 @@ SERVICE_LEXICON = { # Mas complejo para las query
       "extraccion","extracción","caries","endodoncia","muela","diente","dolor de muela", "dentistas",
         "odontologos", "odontologo"
     ],
-    "re":  [r"\b(dent(al|ista)|odontolog[ií]a|limpieza dental|caries|extracci[óo]n)\b"],
+    "re": [
+      r"\b(dentist\w*|dental|odontolog\w*|limpieza\s+dental|caries|extraccion\w*)\b"
+    ],
     "desc": "Atención dental: diagnóstico, limpieza, caries y procedimientos básicos."
   },
 
@@ -219,7 +221,9 @@ SERVICE_LEXICON = { # Mas complejo para las query
       "examen de la vista","ojos","ver borroso","anteojos","armazon","montura", "lentes", "vista", "optometristas",
         "micas"
     ],
-    "re":  [r"\b(optometr(ist(a|as)|ia)|[óo]ptic(a|as)|lentes|graduaci[óo]n|examen\s+de\s+la\s+vista|cambiar\s+micas)\b"],
+    "re": [
+      r"\b(optometr[ia|ista]\w*|optic\w*|lentes?|graduaci?on|examen\s+de\s+la\s+vista|micas?)\b"
+    ],
     "desc": "Evaluación visual y graduación de lentes (óptica)."
   },
 
@@ -238,7 +242,7 @@ SERVICE_LEXICON = { # Mas complejo para las query
       "ansiedad","estrés","estres","depresion","depresión","salud mental", "psicologos",
         "psicologas", "psicologa"
     ],
-    "re":  [r"\b(psicol(og[ií]a|ogo|oga|ogos|ogas)|ansiedad|estr[ée]s|depresi[óo]n|psicol[ó|o]gica)\b"],
+    "re":  [r"\b(psicol\w*|ansiedad|estres|depresion|emocional)\b"],
     "desc": "Atención psicológica y terapia."
   },
 

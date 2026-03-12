@@ -12,6 +12,9 @@ from mistralai import Mistral
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from RAG_CORE.rag_utils.search_utils import norm_txt
+
+
 #################################Augmentation and Generation ##########################
 # Planteamiento del Modelo de LLM
 def _try_tiktoken_encoding():
@@ -239,10 +242,9 @@ class GenerationModuleLlama:
 
                 has_lexicon_match = self.follow_up_model.is_service_in_scope(query)
 
-                if has_lexicon_match or not is_relevant:
+                if not has_lexicon_match and not is_relevant:
                     if self.debug:
-                        print(f"[DEBUG] No hizo match con los temas especificados: {has_lexicon_match} o"
-                              f" no fue relevante: {is_relevant}")
+                        print(f"[DEBUG] Rechazo total: Léxico {has_lexicon_match} y Relevancia {is_relevant}")
                     yield {"text": "out_of_scope", "end_session": False}
                     return
 
@@ -430,10 +432,9 @@ class GenerationModuleMistral(GenerationModuleLlama):
                 is_relevant = any(doc.metadata.get('score', 1.0) <= 0.50 for doc in docs) if docs else False # 0.0 es max relevant
                 has_lexicon_match = self.follow_up_model.is_service_in_scope(query)
 
-                if has_lexicon_match or not is_relevant:
+                if has_lexicon_match and not is_relevant:
                     if self.debug:
-                        print(f"[DEBUG] No hizo match con los temas especificados: {has_lexicon_match} o"
-                              f" no fue relevante: {is_relevant}")
+                        print(f"[DEBUG] Rechazo total: Léxico {has_lexicon_match} y Relevancia {is_relevant}")
                     yield {"text": "out_of_scope", "end_session": False}
                     return
 
@@ -522,13 +523,6 @@ class GenerationModuleMistral(GenerationModuleLlama):
         )
         t1 = time.perf_counter()
 
-        ## Debugging
-        if self.debug:
-            print("Finished invoke, time: ", t1 - t0, " s")
-            # print("Prompt completo:\n", prompt_value)
-            # print("Respuesta tokens:", len(out["choices"][0]["text"].split()))
-            # print("Respuesta completa:\n", out["choices"][0]["text"])
-
         sentence_buffer = ""
         full_response_text = ""
 
@@ -539,11 +533,9 @@ class GenerationModuleMistral(GenerationModuleLlama):
             sentence_buffer += token
 
             # Detectamos fin de oración para disparar el TTS
-            if any(punct in token for punct in ["!", "?", "\n"]):
+            if any(punct in token for punct in ["!", "?"]):
                 clean_sentence = sentence_buffer.strip()
                 if clean_sentence:
-                    if self.debug:
-                        print(clean_sentence)
                     # Quita asteriscos de negrita que el TTS lee como "asterisco"
                     clean_sentence = clean_sentence.replace("*", "")
                     full_response_text += " " + clean_sentence
@@ -555,6 +547,12 @@ class GenerationModuleMistral(GenerationModuleLlama):
         if sentence_buffer.strip():
             full_response_text += " " + sentence_buffer.strip()
             yield {"text": sentence_buffer.strip(), "end_session": False}
+            ## Debugging
+        if self.debug:
+            print("Finished invoke, time: ", t1 - t0, " s")
+            # print("Prompt completo:\n", prompt_value)
+            # print("Respuesta tokens:", len(out["choices"][0]["text"].split()))
+            # print("Respuesta completa:\n", full_response_text)
 
         # Actualizar memoria
         self.memoria.add_turn("user", query)
@@ -731,12 +729,6 @@ class IntentionDetector:
             "audio_complaint": ["te escuchas mal", "está trabado", "audio robótico", "se escucha mal", "no entendi", "no te entiendo"],
             "asesor": ["humano", "asesor", "quiero hablar con un asesor"]
         }
-        self.domain_queries = [
-            "localizar sucursales sedes unidades", # Logística
-            "servicios médicos salud clinica hospital laboratorio dentista optometrista lentes enfermo",         # Salud
-            "horarios de atención dirección ubicación mapa dónde están",    # Información
-            "quiero saber información de la empresa sucursales disponibles" # Intención
-        ]
 
         self.precomputed_embeddings = {}
         for intent, phrases in self.intent_examples.items():
@@ -752,6 +744,7 @@ class IntentionDetector:
         self.emb_refs = [self.model.embeddings.embed_query(e) for e in self.exit_examples]
 
         from RAG_CORE.rag_utils.mappings import SERVICE_LEXICON
+        from RAG_CORE.rag_utils.search_utils import norm_txt
         self.compiled_items = self._compile_lexicon(SERVICE_LEXICON)
 
 
@@ -868,7 +861,7 @@ class IntentionDetector:
 
     def detect_exit_intent(self, user_input: str) -> bool:
         # heurístico rápido
-        TRESHOLD = 0.45
+        TRESHOLD = 0.5
         exit_patterns = [r"\b(terminar|eso es todo|cortar|no tengo más preguntas|terminar|es todo|seria todo)\b"]
         if any(re.search(p, user_input.lower()) for p in exit_patterns):
             return True
@@ -882,22 +875,25 @@ class IntentionDetector:
 
     def get_semantic_intent(self, query: str, threshold: float = 0.45) -> str:
         # 1. Solo generamos UN embedding (el de la pregunta actual)
+        query = norm_txt(query)
         query_emb = self.model.embeddings.embed_query(query)
 
         best_intent = "rag_required"
         max_score = 0
 
-        scores = []
+        all_debug_scores = {}  # Para un debug real
         # 2. Comparamos contra lo que ya tenemos en memoria RAM
         for intent, example_embs in self.precomputed_embeddings.items():
             scores = [cosine_similarity([query_emb], [ex_emb])[0][0] for ex_emb in example_embs]
-            current_max = max(scores)
+            current_max = max(scores) if scores else 0
+            all_debug_scores[intent] = current_max
 
             if current_max > max_score and current_max >= threshold:
                 max_score = current_max
                 best_intent = intent
         if self.debug:
-            print("[DEBUG] Nivel de deteccion de intent: ", scores, " Intent: ", best_intent, ", ", max(scores) >=threshold)
+            print(f"[DEBUG] Scores por Intent: {all_debug_scores}")
+            print(f"[DEBUG] Ganador: {best_intent} ({max_score:.4f}) >= {threshold}: {max_score >= threshold}")
 
         return best_intent
     @staticmethod

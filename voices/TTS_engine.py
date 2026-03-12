@@ -1,4 +1,3 @@
-import io
 import time
 from pathlib import Path
 
@@ -10,7 +9,7 @@ from TTS.utils.radam import RAdam
 import torch.serialization
 from TTS.api import TTS
 import sounddevice as sd
-from kokoro import KPipeline
+# from kokoro import KPipeline
 import soundfile as sf
 from scipy.io import wavfile
 
@@ -33,13 +32,14 @@ class Speaker:
             self.tts = TTS(model_name).to(device)
             self.sr = 22050
         elif engine == "KOKORO":
-            self.tts = KPipeline(lang_code='e')
+            pass
+            # self.tts = KPipeline(lang_code='e')
             self.sr = 24000
         elif engine == "XTTS":
             self.tts = TTS(clone_model).to(device)
             self.sr = 24000
         elif engine == "DG":
-            self.tts = TTS(clone_model).to(device)
+            # self.tts = TTS(clone_model).to(device)
             self.sr = 8000
             self.dg_api_key = dg_api_key
             self.MODEL_NAME = DG_MODEL  #
