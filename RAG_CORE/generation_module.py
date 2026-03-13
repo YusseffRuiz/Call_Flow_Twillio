@@ -58,7 +58,7 @@ class GenerationModuleLlama:
             self.initial_prompt = INIT_PROMPT_LLAMA
         self.retrieval = retrieval
         self.debug = debug
-        self.follow_up_model = IntentionDetector(retrieval=self.retrieval, threshold=0.5, debug=debug)
+        self.follow_up_model = IntentionDetector(retrieval=self.retrieval, threshold=0.65, debug=debug)
         self.memoria = ConversationalMemory(max_tokens=max_tokens)
 
 
@@ -873,7 +873,7 @@ class IntentionDetector:
             print("[DEBUG] Nivel de deteccion de finalizacion: ", scores, " Fin: ", max(scores) >= TRESHOLD)
         return max(scores) >= TRESHOLD  # umbral ajustable
 
-    def get_semantic_intent(self, query: str, threshold: float = 0.45) -> str:
+    def get_semantic_intent(self, query: str) -> str:
         # 1. Solo generamos UN embedding (el de la pregunta actual)
         query = norm_txt(query)
         query_emb = self.model.embeddings.embed_query(query)
@@ -888,12 +888,12 @@ class IntentionDetector:
             current_max = max(scores) if scores else 0
             all_debug_scores[intent] = current_max
 
-            if current_max > max_score and current_max >= threshold:
+            if current_max > max_score and current_max >= self.threshold:
                 max_score = current_max
                 best_intent = intent
         if self.debug:
             print(f"[DEBUG] Scores por Intent: {all_debug_scores}")
-            print(f"[DEBUG] Ganador: {best_intent} ({max_score:.4f}) >= {threshold}: {max_score >= threshold}")
+            print(f"[DEBUG] Ganador: {best_intent} ({max_score:.4f}) >= {self.threshold}: {max_score >= self.threshold}")
 
         return best_intent
     @staticmethod
