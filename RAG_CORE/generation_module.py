@@ -242,7 +242,8 @@ class GenerationModuleLlama:
 
                 has_lexicon_match = self.follow_up_model.is_service_in_scope(query)
 
-                if not has_lexicon_match and not is_relevant:
+                # if not has_lexicon_match and not is_relevant:
+                if not is_relevant:
                     if self.debug:
                         print(f"[DEBUG] Rechazo total: Léxico {has_lexicon_match} y Relevancia {is_relevant}")
                     yield {"text": "out_of_scope", "end_session": False}

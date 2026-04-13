@@ -58,6 +58,16 @@ class AsrEngine:
         # confidence = 0.90 if text else 0.0 # placeholder; faster-whisper no expone prob estable
         return text, confidence, None
 
+    def transcribe_audio(self, audio):
+        segs, info = self.model.transcribe(audio, language="es", vad_filter=True)  ## Ocurre la transcripción de Audio a Texto
+        text = " ".join(seg.text.strip() for seg in segs)
+
+        confidence = info.language_probability if info else 0.0 ## Simulacion para que sea estructura similar entre paga y gratuito.
+
+        # Devolvemos strings y floats nativos, no objetos de Whisper
+        return text, confidence
+
+
 
 class DeepgramAsrEngine:
     def __init__(self, api_key: str, model: str = "nova-2", language: str = "es"):
@@ -67,12 +77,12 @@ class DeepgramAsrEngine:
         self.model = model
         self.language = language
 
-    def transcribe_audio(self, audio_bytes: bytes):
+    def transcribe_audio(self, audio: bytes):
         """
         Transcribe audio recolectado del stream de Twilio.
         """
         try:
-            source = {'buffer': audio_bytes}
+            source = {'buffer': audio}
 
             options = {
                 "model": self.model,

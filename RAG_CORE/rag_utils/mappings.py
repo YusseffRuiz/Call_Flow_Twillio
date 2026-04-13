@@ -360,7 +360,7 @@ SERVICE_LEXICON = { # Mas complejo para las query
 # --- catálogo de estados (variantes comunes) ---
 MX_STATES = {
     "aguascalientes": ["aguascalientes", "ags"],
-    "baja california": ["baja california", "bc"],
+    "baja california": ["baja california", "bc", "b.c.", "b c"],
     "baja california sur": ["baja california sur", "bcs"],
     "campeche": ["campeche"],
     "coahuila": ["coahuila", "coahuila de zaragoza", "coa", "coah"],
@@ -511,6 +511,7 @@ CDMX_BOROUGHS = {
     "azca": ("azcapotzalco","cdmx"),
     # Benito Juárez
     "benito juarez": ("benito juarez","cdmx"),
+    "benito buárez": ("benito juarez","cdmx"),
     "benito juares": ("benito juarez","cdmx"),
     "bj": ("benito juarez","cdmx"),
     # Coyoacán
@@ -553,7 +554,8 @@ CDMX_BOROUGHS = {
 
 # --- Mini-catálogo de cada Estado y municipios (municipios canónicos frecuentes) ---
 EDO_MX_BOROUGHS = {
-        # Ecatepec
+    # Ecatepec
+    "azcapotzalco": ("azcapotzalco","estado de mexico"),
     "ecatepec": ("ecatepec de morelos","estado de mexico"),
     "ecatepec de morelos": ("ecatepec de morelos","estado de mexico"),
     # Naucalpan
@@ -646,6 +648,7 @@ EDO_MX_BOROUGHS = {
     "rayon": ("san isidro rayon","estado de mexico"),
 
     "lomas de san sebastian": ("lomas de san sebastian", "estado de mexico"),
+    "san nicolas tetelco": ("san nicolas tetelco", "estado de mexico"),
 
 }
 
@@ -947,9 +950,9 @@ TLAXCALA_ALIASES = {
     "tlaxcala" : ("tlaxcala de xicohtencatl", "tlaxcala"),
     "tlax": ("tlaxcala de xicohtencatl", "tlaxcala"),
     "apizaco": ("apizaco", "tlaxcala"),
-    "teolocholco": ("teolocholco", "tlaxcala"),
     "santa cruz quilehtla": ("santa cruz quilehtla", "tlaxcala"),
     "teotlalpan": ("teotlalpan", "tlaxcala"),
+    "teolocholco": ("teolocholco", "tlaxcala"),
     "tetla" : ("tetla", "tlaxcala"),
     "contla de juan cuamatzi": ("contla de juan cuamatzi", "tlaxcala"),
     "contra de juan": ("contra de juan cuamatzi", "tlaxcala"),
@@ -1081,6 +1084,17 @@ TAMAULIPAS_ALIASES = {
     "reynosa": ("reynosa","tamaulipas"),
 }
 
+VERACRUZ_ALIASES = {
+    "coatzacoalcos": ("coatzacoalcos","veracruz"),
+    "veracruz": ("veracruz","veracruz"),
+    "ver": ("veracruz","veracruz"),
+}
+
+BC_ALIASES = {
+    "tijuana": ("tijuana","baja california"),
+    "ensenada": ("ensenada","baja california"),
+}
+
 # Mapa de alias -> municipio canónico (por estado si aplica)
 MUNICIPALITY_ALIASES = {
     # CDMX variantes frecuentes #######################################################
@@ -1105,6 +1119,8 @@ MUNICIPALITY_ALIASES = {
     #################### Edo de Mexico ###########################
     **EDO_MX_BOROUGHS,
     #########################################################
+    **VERACRUZ_ALIASES,
+    **BC_ALIASES,
 }
 
 
@@ -1119,6 +1135,7 @@ AMBIG_STATE_MUNI = {
     "san luis potosi": "san luis potosi",
     "zacatecas": "zacatecas",
     "tlaxcala": "tlaxcala de xicohtencatl",
+    "b.c." : "baja california",
 }
 
 
@@ -1143,6 +1160,8 @@ MUNI_BY_STATE_MINI = {
     "guanajuato": GUANAJUATO_ALIASES,
     "sinaloa": SINALOA_ALIASES,
     "cdmx": CDMX_BOROUGHS, # Orden es relevante
+    "veracruz": VERACRUZ_ALIASES,
+    "baja california": BC_ALIASES,
     # agrega más según veas en tus direcciones
 }
 

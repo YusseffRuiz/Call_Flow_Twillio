@@ -26,7 +26,7 @@ from RAG_CORE.interpreter.location_interpreter import LocationInterpreter
 from RAG_CORE.interpreter.interpreter import Interpreter
 
 class RetrievalModule:
-    def __init__(self, database_path, hf_token, model_name, origin_sheet="Unidades", device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, database_path=None, hf_token=None, model_name=None, origin_sheet="Unidades", device="cuda" if torch.cuda.is_available() else "cpu"):
         self.database_path = database_path
         self.hf_token = hf_token
         self.origin_sheet = origin_sheet
@@ -256,8 +256,7 @@ class RetrievalModule:
         fused.sort(key=lambda x: x[1], reverse=True)
         return fused[:k_out]
 
-
-    def rows_to_documents_unidades(self, geolocation):
+    def rows_to_documents_unidades(self, geolocation=None):
         df_geo = _finalize_geo(self.df, geolocation, min_state=60, min_muni=60)
 
         # -------- Construcción de Documents ----------
@@ -270,6 +269,24 @@ class RetrievalModule:
         self.df = self.df.rename(columns=lambda c: str(c).strip())
         today = datetime.date.today()
         header_sequence = list(self.df.columns)  # mantiene el orden original
+
+        # Mapeo inverso para ultimo recurso. Mapear municipios por estado, pero solo los que no tengan repeticion.
+        muni_to_state_catalog = {}
+        ambiguous_munis = set()
+
+        for st, munis in MUNI_BY_STATE_MINI.items():
+            for m in munis:
+                m_norm = norm_txt(m)
+                # Si el municipio ya existe en otro estado, lo marcamos como ambiguo
+                if m_norm in muni_to_state_catalog:
+                    ambiguous_munis.add(m_norm)
+                else:
+                    muni_to_state_catalog[m_norm] = st.title()
+
+        # Purgamos los municipios ambiguos para evitar falsos positivos
+        for m_amb in ambiguous_munis:
+            if m_amb in muni_to_state_catalog:
+                del muni_to_state_catalog[m_amb]
 
         for _, r in df_geo.iterrows():
             nombre_unidad = str(r.get("UNIDAD", "") or "").strip()
@@ -295,6 +312,16 @@ class RetrievalModule:
 
             estado = str(r.get("estado", "") or "").title()
             municipio = str(r.get("municipio", "") or "").title()
+
+            # =========================================================
+            # INFERENCIA DE ESTADO FALTANTE
+            # =========================================================
+            if (not estado or estado.lower() in ["none", "nan", "null"]) and municipio:
+                m_norm = norm_txt(municipio)
+                # Si el municipio normalizado está en nuestro catálogo seguro, imputamos el estado
+                if m_norm in muni_to_state_catalog:
+                    estado = muni_to_state_catalog[m_norm]
+            # =========================================================
 
             row = {
                 "id": doc_id,  #
@@ -348,7 +375,6 @@ class RetrievalModule:
             row["searchable_text"] = build_searchable_text(row)
             rows.append(row)
         kb_df = pd.DataFrame(rows)
-        kb_df.head(10)
         # print(kb_df.head(10))
         return docs, kb_df, df_geo
 

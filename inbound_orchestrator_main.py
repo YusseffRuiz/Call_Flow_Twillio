@@ -2,12 +2,14 @@
 Twilio Real Voice Agent MVP (Bidirectional Media Streams)
 
 Goal:
-- Place ONE outbound call
+- receive inbound call
 - Twilio connects bidirectional Media Stream to this server (WSS)
 - Agent speaks a greeting (XTTS voice clone)
-- Agent asks 2 questions (city/municipality, service)
-- Agent listens using your own ASR (faster-whisper via AsrEngine)
+- Agent asks the reason of the call
+---- Loop ----
+- Agent listens using ASR (faster-whisper via AsrEngine)
 - Agent replies briefly (stub "LLM" logic you can swap)
+--------------
 - Agent says goodbye and ends the call
 
 Important:
@@ -31,23 +33,27 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import json
 import os
 import audioop
 import time
 import uuid
+import wave
+
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
 import numpy as np
+import uvicorn
 import webrtcvad
 import torchaudio
 import torch
 from dotenv import load_dotenv
-import gc
 
 from fastapi import FastAPI, WebSocket, Request, Header, HTTPException
 from fastapi.responses import Response, JSONResponse
+from jedi.inference.compiled.subprocess import __main__
 from llama_cpp import Llama
 from starlette.websockets import WebSocketDisconnect
 from twilio.rest import Client
@@ -87,7 +93,7 @@ API_KEY = os.getenv("API_KEY_INTERNA", "")
 LANGUAGE = os.getenv("AGENT_LANGUAGE", "es")
 
 # Turn-taking / VAD
-SILENCE_MS_END_TURN = 800
+SILENCE_MS_END_TURN = 1000
 MAX_TURN_SECONDS = 10.0
 
 # Twilio Media Streams audio format
@@ -99,7 +105,7 @@ FRAME_MS = 20
 FRAME_SAMPLES_8K = int(TWILIO_SR * (FRAME_MS / 1000.0))  # 160 samples @ 8kHz
 FRAME_BYTES_PCM16 = FRAME_SAMPLES_8K * SAMPLE_WIDTH_BYTES  # 320 bytes PCM16
 
-NOISE_RMS = 600
+NOISE_RMS = 300
 
 LLM_MODEL_FILE = "../HF_Agents/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -138,7 +144,7 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 Augmentation and Generation Portion
 """
 retrieval_module = RetrievalModule(database_path=MEDICAL_EXTENDED, hf_token=HF_TOKEN, model_name=VECTOR_MODEL_NAME)
-retrieval_module.initialize(load_db=True, path_to_database="kb_faiss_langchain", score_threshold = 0.34, percentile = 0.9)
+retrieval_module.initialize(load_db=True, path_to_database="vector_dbs/unidades", score_threshold = 0.34, percentile = 0.9) #  A modificar en el futuro, cuando se agreguen otras tablas
 
 if VERSION_PAGA:
     ASR = DeepgramAsrEngine(api_key=DG_API_KEY)
@@ -229,7 +235,7 @@ class TurnDetector:
     sample_rate: int = TWILIO_SR
     frame_ms: int = FRAME_MS
     min_speech_frames: int = 3
-    rms_speech_threshold: int = 500
+    rms_speech_threshold: int = 300
 
     def __post_init__(self):
         self.vad = webrtcvad.Vad()
@@ -329,7 +335,9 @@ def init_audio_cache():
         "wait": "No te preocupes, aquí espero. Avísame cuando estés listo.",
         "out_of_scope": "Por ahora solo puedo ayudarte con información de nuestras sedes y servicios.",
         "despedida": "Ha sido un gusto ayudarte. ¡Que tengas buen día! ¡Adiós!",
-        "disculpa": "Perdón, no te entendí. ¿Puedes repetirlo?"
+        "disculpa": "Perdón, no te entendí. ¿Puedes repetirlo?",
+        "seguimiento": "¿Sigue ahí? Le escucho.",
+        "seguimiento_fin": "Como no escucho respuesta, terminaré la llamada. Gracias por comunicarse a Medical Life.",
     }
     print("[INIT] Pre-generando audios de sistema...")
     for key, text in frases.items():
@@ -369,15 +377,14 @@ def agent_reply(user_text: str, turn_index: int) -> Tuple[str, bool]:
 # -----------------------------
 @app.api_route("/twilio/answer", methods=["GET", "POST"])
 async def twilio_answer(request: Request):
-    params = request.query_params
-    nombre = params.get("nombre", "Paciente")
+    form_data = await request.form()
+    caller_number = form_data.get("From", "Desconocido")  ## Salvar numero de la llamada entrante.
 
     host = request.headers.get("host")
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)  # ngrok suele ser https
     ws_scheme = "wss" if proto == "https" else "ws"
 
-    from urllib.parse import quote
-    ws_url = f"{ws_scheme}://{host}/twilio/ws?nombre={quote(nombre)}"
+    ws_url = f"{ws_scheme}://{host}/twilio/ws"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -386,6 +393,7 @@ async def twilio_answer(request: Request):
     </Connect>
 </Response>"""
     if DEBUG:
+        print(f"[ANSWER] Llamada entrante de: {caller_number}")
         print("[ANSWER] method:", request.method)
         print("[ANSWER] headers host/proto:", request.headers.get("host"), request.headers.get("x-forwarded-proto"))
         print("[ANSWER] ws_url:", ws_url)
@@ -419,7 +427,7 @@ async def transfer_to_human(call_sid: str):
 # -----------------------------
 @app.post("/twilio/start_call")
 async def twilio_start_call(payload: dict,
-    api_key: str = Header(None, alias="X-API-Key")
+    api_key: str = Header(None)
     ):
     """
     POST JSON:
@@ -431,7 +439,7 @@ async def twilio_start_call(payload: dict,
     if api_key != API_KEY:
         if DEBUG:
             print(f"🚫 Intento de acceso no autorizado con key: {api_key}")
-        raise HTTPException(status_code=403, detail="No autorizado: API Key invalida")
+        raise HTTPException(status_code=403, detail="No autorizado: API Key inválida")
 
     to_number = payload.get("to") or DEFAULT_TO_NUMBER
     paciente_nombre = payload.get("Nombre", "Paciente")
@@ -501,6 +509,7 @@ async def twilio_ws(ws: WebSocket):
     BARGE_MIN_HITS = 3  # 3*20ms = 60ms de voz consistente
     last_tts_task = None
     processing_turn = False
+    uuid_tag = uuid.uuid4().hex[-4:]
 
     ws_send_lock = asyncio.Lock()
 
@@ -639,161 +648,128 @@ async def twilio_ws(ws: WebSocket):
     async def handle_user_turn_stream(pcm16_turn: bytes, call_sid: str, turn_data: dict):
         """ASR -> agent reply -> next prompt / goodbye."""
         nonlocal turn_idx, bot_task
-        speak_logging=False
-        if VERSION_PAGA:
-            text, confidence = ASR.transcribe_audio(pcm16_turn)
+
+        try:
+            with wave.open(f"debug_audio_turno_{turn_idx}_{uuid_tag}.wav", "wb") as wf:
+                wf.setnchannels(1)  # Mono
+                wf.setsampwidth(2)  # 16-bit (2 bytes)
+                wf.setframerate(8000)  # Frecuencia de Twilio
+                wf.writeframes(pcm16_turn)
             if DEBUG:
-                print(text)
-        else:
-            # --- 1: ASR EN MEMORIA ---
-            wav_8k = pcm16_bytes_to_f32(pcm16_turn)
-            peak = float(np.max(np.abs(wav_8k))) if wav_8k.size else 0.0
-            if peak >= 0.2:
-                wav_8k = (wav_8k / peak) * 0.9
-            wav_16k = resample_f32(wav_8k, sr_in=TWILIO_SR, sr_out=16000)
-            if DEBUG:
-                print("[DEBUG] Audio gathered, starting transcribe")
-            # Inferencia de Faster-Whisper
-            segments, _ = ASR.model.transcribe(wav_16k, language=LANGUAGE,
-                                               vad_filter=True)  ## Ocurre la transcripción de Audio a Texto
-            text = " ".join(seg.text.strip() for seg in segments)
-            del segments  # Eliminamos la referencia al objeto de FasterWhisper
+                print(f"[DEBUG] 💾 Audio guardado como debug_audio_turno_{turn_idx}_{uuid_tag}.wav")
+        except Exception as e:
+            print(f"[DEBUG] Error guardando audio: {e}")
 
-        turn_data["t1"] = time.perf_counter()  # Get the time taken to transcribe message
-
-        # Manejo de memoria
-        gc.collect()  # Recolector de basura de Python
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # Liberar memoria de video
-
-        if not text:
-            # Aquí is_partial=False porque es una respuesta de error única
-            turn_data["was_misunderstood"] = True
-            await send_mulaw_audio(PRE_RECORDED_AUDIO["disculpa"], turn_data=None)
-            return
-        if DEBUG:
-            print(f"[ASR] User said: {text}")
-        # 2: GATEKEEPER (EL CEREBRO DE LA MÁQUINA DE ESTADOS) ---
-        end_flag = False
-        # Detección de cierre.
-        if follow_up_model.detect_exit_intent(text):
-            end_flag = True
-        # Safeguards
-        intent = follow_up_model.get_semantic_intent(text)
-        if not end_flag:
-            if intent == "rag_required":
-                # -- RAG / LLM ---
-                # ocurre si el intent fue un RAG required, dice un mensaje de retroalimentacion para el usuario.
-                await  send_mulaw_audio(PRE_RECORDED_AUDIO["filler"], turn_data=None)
-                speak_logging = True
-                # Forzamos que el loop registre la tarea y empiece a enviarla
-                await asyncio.sleep(0.01)
-            elif intent == "asesor":
+        try:
+            if VERSION_PAGA:
+                text, confidence = ASR.transcribe_audio(pcm16_turn)
                 if DEBUG:
-                    print("[DEBUG] Transfiriendo a un asesor humano")
-                if call_sid:
-                    await send_mulaw_audio(PRE_RECORDED_AUDIO["redirigir"], turn_data=None)
-                    await transfer_to_human(call_sid)
-                await ws.close()
-                return
-
+                    print(text)
             else:
-                turn_data["t2"] = time.perf_counter()
-                responses = {
-                    "repeat": f"Claro, te repito: {llm_module.memoria.get_last_assistant_response()}",
-                    "presence": "Aquí sigo atento, ando procesando tu respuesta.",
-                    "wait": "No te preocupes, aquí espero. Avísame cuando estés listo.",
-                    "out_of_scope": "Por ahora solo puedo ayudarte con información de nuestras sedes y servicios.",
-                    "audio_complaint": f"Lamento los problemas de audio, intentaré hablar más claro, repito lo anterior, {llm_module.memoria.get_last_assistant_response()}",
-                }
+                # --- 1: ASR EN MEMORIA ---
+                wav_8k = pcm16_bytes_to_f32(pcm16_turn)
+                peak = float(np.max(np.abs(wav_8k))) if wav_8k.size else 0.0
+                if peak >= 0.2:
+                    wav_8k = (wav_8k / peak) * 0.9
+                wav_16k = resample_f32(wav_8k, sr_in=TWILIO_SR, sr_out=16000)
+                if DEBUG:
+                    print("[DEBUG] Audio gathered, starting transcribe")
+                # Inferencia de Faster-Whisper
+                text, confidence = ASR.transcribe_audio(wav_16k)
+                if DEBUG:
+                    print(text)
 
-                await start_speaking(responses[intent], is_partial=False, turn_data=turn_data)
-                # máquina de estados:
-                if intent == "presence":
-                    # Registramos el turno de repetición antes de salir
-                    turn_data["bot_text"] = f"REPETICIÓN: {responses[intent]}"
-                    # Esperar a T3 como ya lo haces
-                    while turn_data["t3"] == 0: await asyncio.sleep(0.1)
-                    call_metrics.log_turn(turn_data)
-                    return  # Salimos del handler para que no cierre el socket
+            turn_data["t1"] = time.perf_counter()  # Get the time taken to transcribe message
+
+            if not text:
+                # Aquí is_partial=False porque es una respuesta de error única
+                turn_data["was_misunderstood"] = True
+                await send_mulaw_audio(PRE_RECORDED_AUDIO["disculpa"], turn_data=None)
+                return
+            if DEBUG:
+                print(f"[ASR] User said: {text}")
+            # 2: GATEKEEPER (EL CEREBRO DE LA MÁQUINA DE ESTADOS) ---
+            end_flag = await asyncio.to_thread(follow_up_model.detect_exit_intent, text)
+
+
+            if not end_flag:
+                intent = await asyncio.to_thread(follow_up_model.get_semantic_intent, text)
+
+                if intent == "rag_required":
+                    await send_mulaw_audio(PRE_RECORDED_AUDIO["filler"], turn_data=None)
+                    await asyncio.sleep(0.01)  # Yield control
+
+                elif intent == "asesor":
+                    if DEBUG: print("[DEBUG] Transfiriendo a asesor...")
+                    if call_sid:
+                        await send_mulaw_audio(PRE_RECORDED_AUDIO["redirigir"], turn_data=None)
+                        await transfer_to_human(call_sid)
+                    await ws.close()
+                    return
                 else:
-                    # Para repetir, esperar o quejas, terminamos el turno aquí.
+                    turn_data["t2"] = time.perf_counter()
+                    responses = {
+                        "repeat": f"Claro, te repito: {llm_module.memoria.get_last_assistant_response()}",
+                        "presence": "Aquí sigo atento...",
+                        "wait": "No te preocupes, aquí espero...",
+                        "out_of_scope": "Por ahora solo puedo ayudarte con información de sedes y servicios.",
+                        "audio_complaint": f"Lamento los problemas de audio, repito: {llm_module.memoria.get_last_assistant_response()}",
+                    }
+                    await start_speaking(responses[intent], is_partial=False, turn_data=turn_data)
                     return
 
+                # 3. LLM CON CONSUMO PROTEGIDO
+                turn_data["user_text"] = text
+                full_response_text = ""
+                t2_captured = False
 
-
-
-            turn_data["user_text"] = text
-            # --- PARTE 2: CONSUMO DEL LLM STREAM ---
-            full_response_text = ""
-            end_flag = False
-            # Creamos un bloque try para manejar la interrupción total si fuera necesario
-
-            t2_captured = False # Flag to capture first llm sentence.
-
-            async for response in llm_module.rag_answer_stream(text):
-                sentence = response['text']
-
-                # CAPTURA DE T2: Solo ocurre en el primer paquete que contenga texto
-                if not t2_captured and sentence.strip():
-                    t2_captured = True
-                    turn_data["t2"] = time.perf_counter()
-
-                if not sentence:
-                    continue
-                else:
-                    if sentence == "out_of_scope":
-                        await send_mulaw_audio(PRE_RECORDED_AUDIO["out_of_scope"], turn_data=None)
-                    else:
-                        # Hablamos la oración. Usamos is_partial=True para que se encole/procese fluído.
-                        await start_speaking(sentence, is_partial=True, turn_data=turn_data)
-                    full_response_text += " " + sentence
-                    if DEBUG:
-                        print("[ASR] sentence text:", sentence)
-
-            turn_data["bot_text"] = full_response_text
-
-            if speak_logging:
-                timeout_limit = 50  # 5 segundos máximo (50 * 0.1s)
-                count = 0
-                if DEBUG: print("[DEBUG] Esperando a T3 para el log...")
-
-                while turn_data.get("t3", 0) == 0 and count < timeout_limit:
-                    await asyncio.sleep(0.1)
-                    count += 1
-
-                if turn_data.get("t3") == 0:
-                    if DEBUG: print("[WARNING] Timeout alcanzado: T3 se guardará como el timer actual")
-                    turn_data["t3"] = time.perf_counter()
-            turn_data["t_llm_end"] = time.perf_counter()
-            call_metrics.log_turn(turn_data)
-
-            turn_idx += 1
-            if DEBUG:
-                print("[DEBUG] Turno en cuestion: ", turn_idx)
-
-            if "adiós" in full_response_text.lower():
-                end_flag = True
-        if end_flag:
-            # Esperamos a que termine de hablar antes de colgar
-            await send_mulaw_audio(PRE_RECORDED_AUDIO["despedida"], turn_data=None)
-            if bot_task and not bot_task.done():
+                # Este bloque TRY atrapa la cancelación del Barge-In
                 try:
-                    await bot_task
+                    async for response in llm_module.rag_answer_stream(text):
+                        sentence = response['text']
+
+                        if not t2_captured and sentence.strip():
+                            t2_captured = True
+                            turn_data["t2"] = time.perf_counter()
+
+                        if not sentence: continue
+
+                        if sentence == "out_of_scope":
+                            await send_mulaw_audio(PRE_RECORDED_AUDIO["out_of_scope"], turn_data=None)
+                        else:
+                            await start_speaking(sentence, is_partial=True, turn_data=turn_data)
+
+                        full_response_text += " " + sentence
+
                 except asyncio.CancelledError:
-                    pass
-            await asyncio.sleep(1.5)
-            # --- PARTE 3: GESTIÓN DE ESTADOS Y CIERRE ---
-            if DEBUG:
-                print("[WS] Cerrando conexión por fin de turnos o despedida.")
-            await ws.close()
+                    if DEBUG: print(f"[IA] Generación de LLM abortada por Barge-In.")
+                    raise  # Propagamos para que safe_handle_turn termine limpiamente
+
+                turn_data["bot_text"] = full_response_text
+                turn_data["t_llm_end"] = time.perf_counter()
+
+                call_metrics.log_turn(turn_data)
+
+                turn_idx += 1
+
+            if end_flag:
+                await send_mulaw_audio(PRE_RECORDED_AUDIO["despedida"], turn_data=None)
+                if bot_task and not bot_task.done():
+                    try:
+                        await bot_task
+                    except asyncio.CancelledError:
+                        pass
+
+                await asyncio.sleep(1.5)
+                await ws.close()
+        except asyncio.CancelledError:
+            # Captura final si el turno fue cancelado en cualquier punto
+            raise
+        except Exception as e:
+            print(f"[CRITICAL] Error en handle_user_turn_stream: {e}")
 
     async def safe_handle_turn(audio: bytes, sid: str):
         nonlocal processing_turn, turn_idx
-        # if processing_turn:
-        #     return
-        #
-        # processing_turn = True
         t0 = time.perf_counter()
 
         turn_data = {
@@ -810,6 +786,9 @@ async def twilio_ws(ws: WebSocket):
         try:
             # Procesamos el turno (ASR -> RAG -> LLM -> TTS)
             await handle_user_turn_stream(audio, sid, turn_data)
+        except asyncio.CancelledError:
+            if DEBUG:
+                print(f"[INFO] Turno {turn_idx} cancelado limpiamente.")
         except Exception as e:
             print(f"[ERROR] Fallo en el flujo del turno: {e}")
             turn_data["was_misunderstood"] = True
@@ -817,6 +796,15 @@ async def twilio_ws(ws: WebSocket):
             await send_mulaw_audio(PRE_RECORDED_AUDIO["problema_tecnico"])
         finally:
             processing_turn = False
+
+            def clean_gpu_memory():
+                import gc
+                import torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            asyncio.create_task(asyncio.to_thread(clean_gpu_memory))
 
     call_metrics = CallMetrics()
     try:
@@ -863,39 +851,61 @@ async def twilio_ws(ws: WebSocket):
                     print("[DEBUG] Starting second turn")
 
                 payload_b64 = msg["media"]["payload"]
-                pcm16_frame = ulaw_b64_to_pcm16(payload_b64)
+                # pcm16_frame = ulaw_b64_to_pcm16(payload_b64)
+                ulaw_bytes = base64.b64decode(payload_b64)
+                frame_bytes = audioop.ulaw2lin(ulaw_bytes, 2)
+                # frame_bytes = audioop.mul(pcm_bytes, 2, 4.0)
 
-                frame_bytes = pcm16_frame if isinstance(pcm16_frame, (bytes, bytearray)) else pcm16_frame.tobytes()
+                # frame_bytes = pcm16_frame if isinstance(pcm16_frame, (bytes, bytearray)) else pcm16_frame.tobytes()
                 if len(frame_bytes) != FRAME_BYTES_PCM16:  # 320 debug
                     if DEBUG:
                         print("[IN] bad frame size pcm16:", len(frame_bytes))
                     detector.reset()
                     continue
 
-                r = rms_pcm16(frame_bytes)
+                # r = rms_pcm16(frame_bytes)
+                r = audioop.rms(frame_bytes, 2)
+
+                if r > 100 and DEBUG_LEVEL>=2:  # Solo printea si hay algo de ruido
+                    print(f"[SENSOR] RMS: {int(r)} | VAD: {detector.vad.is_speech(frame_bytes, TWILIO_SR)} | Bot speaking: {bot_speaking}")
 
                 # Barge-in: si el bot esta hablando e interrumpen, se limpia y se vuelve a escuchar.
                 if bot_speaking:
                     try:
                         # gate por RMS para no disparar por ruido
-                        if r > NOISE_RMS and detector.vad.is_speech(frame_bytes, TWILIO_SR):
-                            barge_speech_hits += 1
-                            if barge_speech_hits >= BARGE_MIN_HITS:
-                                await send_clear()
-                                await cancel_bot()
-                                detector.reset()
-                                barge_speech_hits = 0
-                            if DEBUG:
-                                print("[BARGE-IN] Voz detectada mientras bot habla")
+                        if r > NOISE_RMS:
+                            if detector.vad.is_speech(frame_bytes, TWILIO_SR):
+                                barge_speech_hits += 1
+                                print(f"   👉 [BARGE-IN EVAL] Hits: {barge_speech_hits}/{BARGE_MIN_HITS}")
+                            else:
+                                # evitamos consonantes sordas y micropausas
+                                pass
                         else:
-                            barge_speech_hits = max(0, barge_speech_hits - 1)
+                            # Solo si hay silencio absoluto de la red, restamos agresivamente
+                            if r < 200:
+                                barge_speech_hits = 0
+
+                        if barge_speech_hits >= BARGE_MIN_HITS:
+                            if DEBUG:
+                                print("[BARGE-IN] 🛑 Voz fuerte detectada. Interrumpiendo al bot.")
+                            await send_clear()
+                            await cancel_bot()
+                            bot_speaking = False
+                            barge_speech_hits = 0
+                            detector.reset()
+
+                        if bot_speaking:
+                            # if r > 100 and DEBUG_LEVEL >= 2:  # Solo printea si hay algo de ruido
+                            #     print(
+                            #         f"[SENSOR] RMS while bot speaks: {int(r)} | VAD: {detector.vad.is_speech(frame_bytes, TWILIO_SR)} | Bot speaking: {bot_speaking}")
+                            continue
+
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"Error VAD: {e}")
                         continue
 
-                    except Exception:
-                        continue
 
-                if r > 100 and DEBUG_LEVEL>=2:  # Solo printea si hay algo de ruido
-                    print(f"[SENSOR] RMS: {int(r)} | VAD: {detector.vad.is_speech(frame_bytes, TWILIO_SR)} | Speaking: {bot_speaking}")
                 finished, turn_audio = detector.add_frame(frame_bytes)
 
                 if finished and DEBUG:
