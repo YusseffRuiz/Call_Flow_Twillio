@@ -34,7 +34,7 @@ class RetrievalModule:
         self.device = device
 
         # self.kb_df = self.build_kb() # 1ra version
-        self.df = files_utils.load_sheet_by_name(self.database_path, self.origin_sheet)
+        self.df = None
         self.kb_df = None
         self.geo_df = None
         self.docs = None
@@ -62,7 +62,7 @@ class RetrievalModule:
         self._bm25_ids = []
 
 
-    def initialize(self, path_to_database="kb_faiss_langchain", save_db = False, load_db = False, score_threshold=0.36, percentile = 0.85):
+    def initialize(self, path_to_database="vector_dbs", save_db = False, load_db = False, score_threshold=0.36, percentile = 0.85):
         """
         :param path_to_database: Path para guardar o cargar la base de datos
         :param save_db: True si queremos crear una nueva DB
@@ -100,11 +100,59 @@ class RetrievalModule:
             muni_score_cut=70
         )
 
-        docs, self.kb_df, self.geo_df = self.rows_to_documents_unidades(self.geo)
-
+        import os
         if load_db:
-            self.load_kb(kb_path=path_to_database, embeddings=self.embeddings)
+            # Cargar dinámicamente TODAS las subcarpetas
+            # Escanea la carpeta padre (ej. "vector_dbs") buscando subcarpetas
+            subfolders = [f.path for f in os.scandir(path_to_database) if f.is_dir()]
+            if not subfolders:
+                raise FileNotFoundError(f"[CRÍTICO] No se encontraron subcarpetas en {path_to_database}")
+
+            self.vectorstore = None
+            dfs_a_unir = []
+
+            for folder in subfolders:
+                print(f"[RAG] Cargando e integrando base de datos desde: {folder}")
+
+                # 1. Cargar y fusionar el cerebro vectorial (FAISS)
+                temp_vs = FAISS.load_local(folder, self.embeddings, allow_dangerous_deserialization=True)
+                if self.vectorstore is None:
+                    self.vectorstore = temp_vs
+                else:
+                    self.vectorstore.merge_from(temp_vs)  # ¡Magia de LangChain!
+
+                # 2. Cargar y preparar el catálogo estructurado (Pandas)
+                df_path = os.path.join(folder, "kb_df.pkl")
+                if os.path.exists(df_path):
+                    df_temporal = pd.read_pickle(df_path)
+
+                    # CATCH DE SEGURIDAD: Si por error se guardó una tupla, la extraemos
+                    if isinstance(df_temporal, pd.DataFrame):
+                        dfs_a_unir.append(df_temporal)
+                        print(f"  ✅ DataFrame estructurado cargado.")
+                    else:
+                        print(
+                            f"  ⚠️ ALERTA: El archivo en {folder} no es un DataFrame (es {type(df_temporal)}). Ignorando.")
+                else:
+                    print(f"[ADVERTENCIA] No se encontró {df_path}")
+
+                # 3. Concatenar todas las tablas en una sola matriz maestra
+            if dfs_a_unir:
+                self.kb_df = pd.concat(dfs_a_unir, ignore_index=True)
+                print(f"[RAG] 🧠 Bases de datos fusionadas. Total registros tabulares: {len(self.kb_df)}")
+            else:
+                raise ValueError("No se pudo cargar ningún DataFrame de las bases de datos.")
+
+                # 4. Reconstruir los documentos de LangChain para los filtros
+            self.docs = self._all_docs()
+            print(f"[RAG] 📚 Total documentos indexados: {len(self.docs)}")
         else:
+            print(f"[RAG] 🛠️ Generando nueva base de datos en '{path_to_database}'...")
+            if self.df is None:
+                self.df = files_utils.load_sheet_by_name(self.database_path, self.origin_sheet)
+            docs, self.kb_df, self.geo_df = self.rows_to_documents_unidades(self.geo)
+            self.docs = docs
+
             self.vectorstore = FAISS.from_documents(
                 documents=docs,
                 embedding=self.embeddings,
@@ -119,7 +167,6 @@ class RetrievalModule:
                 self.state_lookup[norm_txt(v)] = canon
 
         self.by_state, self.all_munis = self.build_geo_lexicons()
-        self.docs = docs
         # --- Intérpretes de servicio y ubicación ---
         self.service_interpreter = ServiceInterpreter(self.embeddings)
         self.location_interpreter = LocationInterpreter(
@@ -140,7 +187,10 @@ class RetrievalModule:
 
 
     def save_kb(self, db_name="kb_faiss_langchain"):
+        import os
         self.vectorstore.save_local(db_name)
+        df_export_path = os.path.join(db_name, "kb_df.pkl")
+        self.kb_df.to_pickle(df_export_path)
 
     def load_kb(self, kb_path, embeddings):
         self.vectorstore = FAISS.load_local(kb_path, embeddings, allow_dangerous_deserialization=True)
@@ -287,7 +337,7 @@ class RetrievalModule:
         for m_amb in ambiguous_munis:
             if m_amb in muni_to_state_catalog:
                 del muni_to_state_catalog[m_amb]
-
+        print(self.kb_df)
         for _, r in df_geo.iterrows():
             nombre_unidad = str(r.get("UNIDAD", "") or "").strip()
             if not nombre_unidad:

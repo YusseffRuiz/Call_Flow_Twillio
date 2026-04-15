@@ -3,6 +3,9 @@ import os
 from dotenv import load_dotenv
 from RAG_CORE.retrieval_module import RetrievalModule
 
+"""
+Tarea a correr cada 24 horas para actualizar base de datos.
+"""
 
 # ==========================================
 # CONFIGURACIÓN MULTI-FAISS

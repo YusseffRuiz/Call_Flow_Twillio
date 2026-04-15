@@ -102,7 +102,7 @@ FRAME_MS = 20
 FRAME_SAMPLES_8K = int(TWILIO_SR * (FRAME_MS / 1000.0))  # 160 samples @ 8kHz
 FRAME_BYTES_PCM16 = FRAME_SAMPLES_8K * SAMPLE_WIDTH_BYTES  # 320 bytes PCM16
 
-NOISE_RMS = 300
+NOISE_RMS = 500
 
 LLM_MODEL_FILE = "../HF_Agents/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -115,7 +115,8 @@ if not api_key_mistral:
 if not DG_API_KEY:
     raise Exception("DEEPGRAM_API_KEY not found")
 
-MEDICAL_EXTENDED = "Documents/medical_life_real.xlsx"
+DRIVE_URL = "https://docs.google.com/spreadsheets/d/1pAciTjKST3Yn0KMnmZM02-xXWwwdJShn/export?format=xlsx"
+BASE_DB_DIR = "./vector_dbs"
 
 VECTOR_MODEL_NAME = 'jinaai/jina-embeddings-v2-base-es'
 
@@ -140,8 +141,14 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 """
 Augmentation and Generation Portion
 """
-retrieval_module = RetrievalModule(database_path=MEDICAL_EXTENDED, hf_token=HF_TOKEN, model_name=VECTOR_MODEL_NAME)
-retrieval_module.initialize(load_db=True, path_to_database="vector_dbs/unidades", score_threshold = 0.34, percentile = 0.9) #  A modificar en el futuro, cuando se agreguen otras tablas
+
+RAG_CONFIG = {
+    "UNIDADES": "unidades",
+    # "SERV FUNERARIOS": "funerarias", # <-- Listo para el futuro
+    #  "SERVICIOS" "servicios",
+}
+retrieval_module = RetrievalModule(hf_token=HF_TOKEN, model_name=VECTOR_MODEL_NAME)
+retrieval_module.initialize(load_db=True, path_to_database="vector_dbs", score_threshold = 0.34, percentile = 0.9) #  A modificar en el futuro, cuando se agreguen otras tablas
 
 if VERSION_PAGA:
     ASR = DeepgramAsrEngine(api_key=DG_API_KEY)
@@ -534,37 +541,17 @@ async def twilio_ws(ws: WebSocket):
         nonlocal bot_speaking, bot_pending, bot_started_streaming, last_bot_end_ts
         bot_speaking = True
         try:
-            frame_size = FRAME_SAMPLES_8K  # 160 bytes = 20ms @ 8k
             if DEBUG:
                 print("[OUT] sending mulaw bytes:", len(mulaw_bytes), "streamSid:", stream_sid)
+            if not bot_started_streaming:
+                bot_started_streaming = True
+                bot_pending = False
 
-            t0 = time.perf_counter()
-            sent_frames = 0
+            payload_b64 = base64.b64encode(mulaw_bytes).decode("ascii")
+            msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": payload_b64}}
+            await ws_send(msg)
 
-            for i in range(0, len(mulaw_bytes), frame_size):
-                # si nos cancelan por barge-in, salimos rápido
-                if asyncio.current_task().cancelled():
-                    raise asyncio.CancelledError()
-
-                chunk = mulaw_bytes[i:i + frame_size]
-
-                if not bot_started_streaming:
-                    bot_started_streaming = True
-                    bot_pending = False
-                if not chunk:
-                    continue
-
-                payload_b64 = base64.b64encode(chunk).decode("ascii")
-                msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": payload_b64}}
-                await ws_send(msg)
-
-                sent_frames += 1
-                target = t0 + sent_frames * (FRAME_MS / 1000.0)  # 20ms por frame
-                delay = target - time.perf_counter()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-            # --- NUEVO: Enviamos la marca de "fin de audio" a Twilio ---
+            # --- Enviamos la marca de "fin de audio" a Twilio ---
             mark_msg = {
                 "event": "mark",
                 "streamSid": stream_sid,
@@ -870,17 +857,19 @@ async def twilio_ws(ws: WebSocket):
                 if bot_speaking:
                     try:
                         # gate por RMS para no disparar por ruido
+                        if DEBUG_LEVEL >= 2:
+                            print(f"[BARGE IN ATTEMPT] r = {r}")
                         if r > NOISE_RMS:
                             if detector.vad.is_speech(frame_bytes, TWILIO_SR):
                                 barge_speech_hits += 1
                                 print(f"   👉 [BARGE-IN EVAL] Hits: {barge_speech_hits}/{BARGE_MIN_HITS}")
                             else:
                                 # evitamos consonantes sordas y micropausas
-                                pass
+                                barge_speech_hits = max(0, barge_speech_hits - 1)
                         else:
                             # Solo si hay silencio absoluto de la red, restamos agresivamente
-                            if r < 200:
-                                barge_speech_hits = 0
+                            if r < 500:
+                                barge_speech_hits = max(0, barge_speech_hits - 2)
 
                         if barge_speech_hits >= BARGE_MIN_HITS:
                             if DEBUG:

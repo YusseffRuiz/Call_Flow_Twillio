@@ -238,14 +238,15 @@ class GenerationModuleLlama:
             else:
                 resp, docs = await loop.run_in_executor(None, lambda: self.retrieval.ask(query, return_docs=True,
                                                                                          memoria=self.memoria))
-                is_relevant = any(doc.metadata.get('score', 1.0) <= 0.50 for doc in docs) if docs else False  # 0.0 es max relevant
+                is_relevant_score = min(doc.metadata.get('score', 1.0) <= 0.60 for doc in docs) if docs else 1.0
+                is_relevant = any(doc.metadata.get('score', 1.0) <= 0.60 for doc in docs) if docs else False  # 0.0 es max relevant
 
                 has_lexicon_match = self.follow_up_model.is_service_in_scope(query)
 
                 # if not has_lexicon_match and not is_relevant:
                 if not is_relevant:
                     if self.debug:
-                        print(f"[DEBUG] Rechazo total: Léxico {has_lexicon_match} y Relevancia {is_relevant}")
+                        print(f"[DEBUG] Rechazo total: Léxico {has_lexicon_match} y Relevancia {is_relevant}: {is_relevant_score}")
                     yield {"text": "out_of_scope", "end_session": False}
                     return
 
