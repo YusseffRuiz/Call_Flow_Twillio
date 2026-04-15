@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import gc
 import json
 import os
 import audioop
@@ -45,7 +44,6 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
 import numpy as np
-import uvicorn
 import webrtcvad
 import torchaudio
 import torch
@@ -53,7 +51,6 @@ from dotenv import load_dotenv
 
 from fastapi import FastAPI, WebSocket, Request, Header, HTTPException
 from fastapi.responses import Response, JSONResponse
-from jedi.inference.compiled.subprocess import __main__
 from llama_cpp import Llama
 from starlette.websockets import WebSocketDisconnect
 from twilio.rest import Client
