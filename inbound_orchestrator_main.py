@@ -649,16 +649,16 @@ async def twilio_ws(ws: WebSocket):
         """ASR -> agent reply -> next prompt / goodbye."""
         nonlocal turn_idx, bot_task
 
-        try:
-            with wave.open(f"debug_audio_turno_{turn_idx}_{uuid_tag}.wav", "wb") as wf:
-                wf.setnchannels(1)  # Mono
-                wf.setsampwidth(2)  # 16-bit (2 bytes)
-                wf.setframerate(8000)  # Frecuencia de Twilio
-                wf.writeframes(pcm16_turn)
-            if DEBUG:
+        if DEBUG_LEVEL >= 3:
+            try:
+                with wave.open(f"debug_audio_turno_{turn_idx}_{uuid_tag}.wav", "wb") as wf:
+                    wf.setnchannels(1)  # Mono
+                    wf.setsampwidth(2)  # 16-bit (2 bytes)
+                    wf.setframerate(8000)  # Frecuencia de Twilio
+                    wf.writeframes(pcm16_turn)
                 print(f"[DEBUG] 💾 Audio guardado como debug_audio_turno_{turn_idx}_{uuid_tag}.wav")
-        except Exception as e:
-            print(f"[DEBUG] Error guardando audio: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error guardando audio: {e}")
 
         try:
             if VERSION_PAGA:
