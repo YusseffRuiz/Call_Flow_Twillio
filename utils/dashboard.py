@@ -12,6 +12,21 @@ if root_path not in sys.path:
 from RAG_CORE.rag_utils.mappings import SYN, MX_STATES
 
 
+"""
+Archivo principal para lectura de estadísticas de las llamadas. ya sean inbound o outbound.
+Para correrlo usar desde la carpeta utils:
+streamlit run dashboard.py
+
+La pagina se actualiza cada que existe una interacción (click de botón) o se refresca.
+No se recomienda agregar un sistema de auto refrescar debido a que la pagina parpadearía continuamente.
+
+Para deployment se debe cambiar parámetro de puerto y correrlo de la siguiente manera:
+streamlit run dashboard.py --server.port 5000 --server.address 0.0.0.0
+
+
+"""
+
+
 # Configuración profesional de la página
 st.set_page_config(page_title="CORA Business Intelligence", layout="wide", page_icon="📈")
 
@@ -71,7 +86,7 @@ if search_call:
 # --- SECCIÓN 1: MÉTRICAS FINANCIERAS (KPIs) ---
 st.divider()
 st.header("💰 Indicadores Financieros")
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 
 with m1:
     total_cost = df_filtered['stats.cost'].sum()
@@ -80,9 +95,14 @@ with m2:
     avg_call_cost = df_filtered['stats.cost'].mean()
     st.metric("Costo Promedio / Turno", f"${avg_call_cost:.5f} USD")
 with m3:
+    costo_total_por_llamada = df_filtered.groupby('call_id')['stats.cost'].sum()
+    costo_promedio_llamada = costo_total_por_llamada.mean()
+    st.metric(label="Costo Promedio por Llamada (USD)", value=f"${costo_promedio_llamada:.4f}")
+
+with m4:
     total_turns = len(df_filtered)
     st.metric("Volumen de Interacciones", f"{total_turns} turnos")
-with m4:
+with m5:
     # ROI Proyectado: Comparando vs costo de agente humano (aprox $0.15 USD por turno) --- Ejemplo
     human_cost_est = total_turns * 0.15
     savings = human_cost_est - total_cost
@@ -90,19 +110,20 @@ with m4:
 
 # --- SECCIÓN 2: DESEMPEÑO TÉCNICO Y EXPERIENCIA DE USUARIO ---
 st.divider()
-col_left, col_right = st.columns(2)
+col_left, col_mid, col_right = st.columns(3)
 
 with col_left:
     st.subheader("⏱️ Análisis de Latencias (Promedio)")
     # Muestra cuánto tiempo real espera el usuario
+    latencies_e2e = df_filtered['latencies.e2e'].mean() if df_filtered['latencies.e2e'].mean() > 0 else 0
     lat_data = {
         'Etapa': ['ASR (Voz)', 'LLM (Pensar)', 'E2E (Total)'],
-        'Segundos': [df_filtered['latencies.asr'].mean(), df_filtered['latencies.llm_first_token'].mean(), df_filtered['latencies.e2e'].mean()]
+        'Segundos': [df_filtered['latencies.asr'].mean(), df_filtered['latencies.llm_first_token'].mean(), latencies_e2e]
     }
     fig_lat = px.bar(lat_data, x='Etapa', y='Segundos', color='Etapa', text_auto='.2s')
     st.plotly_chart(fig_lat, use_container_width=True)
 
-with col_right:
+with col_mid:
     st.subheader("🎯 Calidad de Entendimiento (NER/RAG)")
     # Identificamos respuestas fallidas o fuera de dominio
     oos_count = df_filtered[df_filtered['texts.bot'].str.contains("out_of_scope")].shape[0]
@@ -115,6 +136,18 @@ with col_right:
         hole=0.4
     )
     st.plotly_chart(fig_pie, use_container_width=True)
+
+with col_right:
+    # Gráfico de distribución de costos por llamada
+    st.subheader("Distribución de Costos por Llamada")
+    fig_cost_dist = px.histogram(
+        costo_total_por_llamada,
+        x='stats.cost',
+        nbins=20,
+        title="Distribución de Costos Totales por Llamada",
+        labels={'stats.cost': 'Costo Total (USD)', 'count': 'Frecuencia'}
+    )
+    st.plotly_chart(fig_cost_dist, use_container_width=True)
 
 # --- SECCIÓN 3: INTELIGENCIA DE VENTAS ---
 st.divider()
