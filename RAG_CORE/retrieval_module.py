@@ -33,7 +33,6 @@ class RetrievalModule:
         self.model_name = model_name
         self.device = device
 
-        # self.kb_df = self.build_kb() # 1ra version
         self.df = None
         self.kb_df = None
         self.geo_df = None
