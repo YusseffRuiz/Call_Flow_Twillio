@@ -834,6 +834,9 @@ async def twilio_ws(ws: WebSocket):
                 if DEBUG_LEVEL >= 3:
                     print("[DEBUG] Starting second turn")
 
+                """
+                Darle estructura de voz
+                """
                 payload_b64 = msg["media"]["payload"]
                 # pcm16_frame = ulaw_b64_to_pcm16(payload_b64)
                 ulaw_bytes = base64.b64decode(payload_b64)
@@ -849,6 +852,10 @@ async def twilio_ws(ws: WebSocket):
 
                 # r = rms_pcm16(frame_bytes)
                 r = audioop.rms(frame_bytes, 2)
+
+                """
+                Fin de estructura de voz
+                """
 
                 if r > 100 and DEBUG_LEVEL>=2:  # Solo printea si hay algo de ruido
                     print(f"[SENSOR] RMS: {int(r)} | VAD: {detector.vad.is_speech(frame_bytes, TWILIO_SR)} | Bot speaking: {bot_speaking}")
