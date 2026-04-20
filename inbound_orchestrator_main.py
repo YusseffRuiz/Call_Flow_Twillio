@@ -688,7 +688,6 @@ async def twilio_ws(ws: WebSocket):
                     if call_sid:
                         await send_mulaw_audio(PRE_RECORDED_AUDIO["redirigir"], turn_data=None)
                         await transfer_to_human(call_sid)
-                    await ws.close()
                     return
                 else:
                     turn_data["t2"] = time.perf_counter()
